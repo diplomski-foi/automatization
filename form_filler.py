@@ -1730,7 +1730,7 @@ def run_session(task: dict) -> list[dict]:
             blocked = False   # je li ovaj job bio blokiran?
             try:
                 browser = p.chromium.launch(
-                    headless=CFG.headless, slow_mo=CFG.slow, args=launch_args)
+                    headless=True, slow_mo=CFG.slow, args=launch_args, channel="chromium")
 
                 context = browser.new_context(
                     user_agent=ua, viewport=viewport, locale=locale,
