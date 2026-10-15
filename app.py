@@ -16,6 +16,12 @@ import streamlit as st
 from inputs import load_table, load_logins, parse_urls
 
 
+@st.cache_resource
+def install_browser():
+    subprocess.run(["playwright", "install", "chromium"], check=True)
+
+install_browser()
+
 def _under_streamlit() -> bool:
     try:
         from streamlit.runtime.scriptrunner import get_script_run_ctx
