@@ -1,0 +1,2075 @@
+
+
+########## FILE: requirements.txt ##########
+
+playwright>=1.45
+faker>=25
+openpyxl>=3.1
+streamlit>=1.35
+
+
+########## FILE: form_filler.py ##########
+
+"""Dynamic form filler (Playwright).
+
+Discovers every field on a page (input/select/textarea, custom dropdowns,
+shadow DOM, iframes), infers a label for each one from the page source and
+matches it to the keys of a data row by name similarity. Handles multi-step
+forms, logging in first, CAPTCHA pauses (a human solves them), file uploads,
+fake data for missing fields, validation-aware retries and batch runs over
+many URLs x many data rows x many accounts (optionally in parallel).
+
+Run from PyCharm with no arguments to use test_form.html and data.json.
+"""
+import argparse
+import json
+import re
+import sys
+import unicodedata
+from concurrent.futures import ProcessPoolExecutor
+from dataclasses import dataclass, field
+from difflib import SequenceMatcher
+from pathlib import Path
+
+from playwright.sync_api import sync_playwright, Page, Frame
+
+from datagen import DataGen
+from inputs import load_table, load_urls, load_logins, parse_urls, to_file_uri_if_path
+
+BASE = Path(__file__).resolve().parent
+DEFAULT_URL = (BASE / "test_form.html").as_uri()
+DEFAULT_DATA = BASE / "data.json"
+DEFAULT_OUT = BASE / "output"
+THRESHOLD = 0.65
+MAX_STEPS = 10  # max steps (pages) of one form
+
+
+@dataclass
+class Settings:
+    headless: bool = False
+    slow: int = 300
+    submit: bool = True
+    next_words: list = field(default_factory=lambda: [
+        "next", "continue", "proceed", "forward"])
+    submit_words: list = field(default_factory=lambda: [
+        "submit", "send", "register", "signup", "sign up", "login", "log in",
+        "signin", "sign in", "save", "apply", "create", "finish", "confirm"])
+    next_selector: str | None = None
+    submit_selector: str | None = None
+    fake_missing: bool = False   # generate values for fields without data
+    faker_locale: str = "en_US"
+    retries: int = 2             # re-submit attempts after validation errors
+    interactive: bool = False    # a human can press Enter in this terminal
+    captcha_timeout: int = 180   # seconds to wait for a human to solve a CAPTCHA
+    cookies: str = "accept"      # cookie banners: accept | reject | ignore
+    hold: float | None = None    # seconds to keep the browser open at the end
+    job_pause: float = 2.0       # seconds to wait after each job (visible runs)
+    highlight: bool = True       # outline the field being filled (visible runs)
+    debug: bool = False          # print the signals and top candidates of every field
+    inspect: bool = False        # only list the fields, do not fill anything
+    field_map: dict = field(default_factory=dict)  # {"css selector": "key" | "=literal"}
+    out: Path = DEFAULT_OUT
+
+
+CFG = Settings()
+
+# Small synonym dictionary: normalized data key -> alternative field names.
+ALIASES = {
+    "fullname": ["name", "yourname", "customername", "contactname", "displayname",
+                 "completename"],
+    "firstname": ["givenname", "forename", "fname", "first"],
+    "lastname": ["surname", "familyname", "lname", "last"],
+    "email": ["mail", "emailaddress", "useremail", "regemail"],
+    "phone": ["telephone", "tel", "mobile", "phonenumber", "cell", "msisdn"],
+    "birthdate": ["dob", "birthday", "dateofbirth", "bday", "birth"],
+    "city": ["town"],
+    "country": ["nation"],
+    "address": ["street", "streetaddress"],
+    "message": ["comment", "comments", "notes", "description"],
+    "gender": ["sex"],
+    "username": ["user", "login", "userid", "uname", "usr"],
+    "password": ["pass", "pwd", "passwd", "regpasswd"],
+    "resume": ["cv", "attachment", "upload"],
+}
+
+# HTML autocomplete="..." tokens and input types are strong, label-free hints.
+AUTOCOMPLETE_HINTS = {
+    "given-name": "firstname", "family-name": "lastname", "email": "email",
+    "tel": "phone", "bday": "birthdate", "country": "country", "country-name": "country",
+    "street-address": "address", "address-line1": "address", "address-level2": "city",
+    "username": "username", "current-password": "password", "new-password": "password",
+}
+KIND_HINTS = {"email": "email", "tel": "phone", "password": "password"}
+
+CAPTCHA_SELECTOR = (".g-recaptcha, .h-captcha, .cf-turnstile, [data-sitekey], "
+                    "iframe[src*='captcha'], iframe[src*='turnstile']")
+
+# JS run in every frame: find visible, enabled fields (also inside open shadow
+# roots) and infer their labels from the page source. Tags each field with
+# data-ff-idx. Includes custom dropdowns (role=combobox / aria-haspopup=listbox).
+DISCOVER_JS = """
+() => {
+  const COMBO = '[role=combobox], [aria-haspopup=listbox]';
+  const FORMISH = 'input, select, textarea, button, script, style';
+  const dedupe = s => {  // "Ime Ime Prezime" -> "Ime Prezime"
+    const out = [];
+    for (const w of s.split(' '))
+      if (!out.length || out[out.length - 1].toLowerCase() !== w.toLowerCase()) out.push(w);
+    return out.join(' ');
+  };
+  const clean = s => dedupe((s || '').replace(/\\s+/g, ' ').trim());
+  const deepAll = (root, sel, out = []) => {   // querySelectorAll through shadow roots
+    root.querySelectorAll(sel).forEach(e => out.push(e));
+    root.querySelectorAll('*').forEach(e => { if (e.shadowRoot) deepAll(e.shadowRoot, sel, out); });
+    return out;
+  };
+  deepAll(document, '[data-ff-idx]').forEach(e => e.removeAttribute('data-ff-idx'));
+  // Visible text nodes joined by spaces (adjacent <span>/<div> no longer glue together).
+  const spaced = (node, skipControls) => {
+    const parts = [];
+    const walker = document.createTreeWalker(node, NodeFilter.SHOW_TEXT);
+    let n;
+    while ((n = walker.nextNode())) {
+      const p = n.parentElement;
+      if (!p) continue;
+      if (p.closest('script, style, noscript')) continue;
+      if (skipControls && p.closest('select, textarea, option')) continue;
+      const cs = getComputedStyle(p);
+      if (cs.display === 'none' || cs.visibility === 'hidden') continue;
+      parts.push(n.textContent);
+    }
+    return clean(parts.join(' '));
+  };
+  const own = l => spaced(l, true);  // label text without nested controls
+  // Structural (language independent) signals of an element.
+  const attr = (n, a) => (n.getAttribute && n.getAttribute(a)) || '';
+  const dataOf = el => [...el.attributes]
+    .filter(a => a.name.startsWith('data-') && a.name !== 'data-ff-idx')
+    .map(a => a.name.slice(5) + ' ' + a.value.slice(0, 60)).join(' ');
+  const ctxOf = el => {  // classes/ids of the nearest wrappers, up to the form
+    const out = [];
+    let p = el.parentElement;
+    for (let i = 0; p && i < 3 && p.tagName !== 'FORM' && p.tagName !== 'BODY'; i++, p = p.parentElement) {
+      out.push(attr(p, 'class'));
+      if (p.id) out.push(p.id);
+    }
+    return out.join(' ');
+  };
+  // Text that visually precedes the element: previous siblings, then the
+  // parent's previous siblings. Stops at another field or a heading, so it
+  // never borrows the label of a neighbouring input or the page title.
+  const textBefore = el => {
+    let node = el;
+    for (let depth = 0; depth < 2 && node && node !== document.body; depth++) {
+      let sib = node.previousSibling;
+      while (sib) {
+        let t = '';
+        if (sib.nodeType === 3) t = sib.textContent;
+        else if (sib.nodeType === 1) {
+          if (sib.matches(FORMISH) || sib.querySelector(FORMISH)) return '';
+          if (/^H[1-6]$/.test(sib.tagName)) return '';
+          t = spaced(sib, false);
+        }
+        t = clean(t);
+        if (t) return t;
+        sib = sib.previousSibling;
+      }
+      node = node.parentElement;
+    }
+    return '';
+  };
+  // Text injected through CSS (content: "...") on ::before / ::after.
+  const pseudo = (node, which) => {
+    if (!node) return '';
+    const c = getComputedStyle(node, which).content;
+    if (!c || c === 'none' || c === 'normal') return '';
+    return clean(c.replace(/^["']|["']$/g, ''));
+  };
+  const ariaLabelled = el => {   // text of the elements named by aria-labelledby
+    const lb = el.getAttribute('aria-labelledby');
+    if (!lb) return '';
+    const root = el.getRootNode();
+    return clean(lb.split(/\\s+/).map(id => root.getElementById(id)
+      ? spaced(root.getElementById(id), false) : '').join(' '));
+  };
+  // Returns [labelText, source] using the most reliable signal first.
+  const labelOf = el => {
+    if (el.labels && el.labels.length) {
+      const t = clean([...el.labels].map(own).join(' '));
+      if (t) return [t, 'label-for'];
+    }
+    const al = clean(el.getAttribute('aria-label'));
+    if (al) return [al, 'aria-label'];
+    const lb = el.getAttribute('aria-labelledby');
+    if (lb) {
+      const root = el.getRootNode();
+      const t = clean(lb.split(/\\s+/).map(id => (root.getElementById(id) ? spaced(root.getElementById(id), false) : '')).join(' '));
+      if (t) return [t, 'aria-labelledby'];
+    }
+    const w = el.closest('label');
+    if (w) { const t = own(w); if (t) return [t, 'wrapping-label']; }
+    const ti = clean(el.getAttribute('title'));
+    if (ti) return [ti, 'title'];
+    const cell = el.closest('td, th');
+    if (cell && cell.previousElementSibling) {
+      const t = spaced(cell.previousElementSibling, false);
+      if (t && t.length < 60) return [t, 'table-cell'];
+    }
+    const tb = textBefore(el);
+    if (tb && tb.length < 60) return [tb, 'preceding-text'];
+    for (const [n, w2] of [[el.parentElement, '::before'], [el.previousElementSibling, '::after'],
+                           [el, '::before']]) {
+      const t = pseudo(n, w2);
+      if (t) return [t, 'css-pseudo'];
+    }
+    return ['', 'none'];
+  };
+  const skip = ['hidden', 'submit', 'button', 'reset', 'image'];
+  const fields = [], radios = {}, combos = new Set();
+  const EDITABLE = '[contenteditable]:not([contenteditable=false]), [role=textbox]';
+  deepAll(document, 'input, select, textarea, ' + EDITABLE + ', ' + COMBO).forEach((el, i) => {
+    const isCombo = el.tagName !== 'SELECT' && el.matches(COMBO);
+    const isTextbox = !isCombo && !['INPUT', 'SELECT', 'TEXTAREA'].includes(el.tagName);
+    if (isTextbox && el.querySelector('input, textarea, select')) return;  // just a wrapper
+    const host = el.parentElement && el.parentElement.closest(COMBO);
+    if (host && combos.has(host)) return;  // inner input of a custom dropdown
+    const type = isCombo ? 'combobox' : isTextbox ? 'textbox'
+      : el.tagName === 'SELECT' ? 'select'
+      : el.tagName === 'TEXTAREA' ? 'textarea' : (el.type || 'text').toLowerCase();
+    if (skip.includes(type) || el.disabled || el.readOnly) return;
+    if (el.getAttribute('aria-disabled') === 'true') return;
+    const shown = el.offsetWidth || el.offsetHeight || el.getClientRects().length;
+    const labelShown = el.labels && [...el.labels].some(l => l.offsetWidth || l.offsetHeight);
+    const toggle = (type === 'checkbox' || type === 'radio') && labelShown;  // styled toggles
+    if (!shown && type !== 'file' && !toggle) return;  // file inputs are often hidden
+    if (isCombo) combos.add(el);
+    el.setAttribute('data-ff-idx', i);
+    const [label, source] = labelOf(el);
+    const invalid = el.matches(':invalid, [aria-invalid="true"]');
+    if (type === 'radio') {
+      const key = el.name || ('radio' + i);
+      if (!radios[key]) {
+        const legend = el.closest('fieldset')?.querySelector('legend')?.innerText || '';
+        radios[key] = { kind: 'radio', idx: i, name: el.name, id: '', placeholder: '',
+                        autocomplete: '', label: clean(legend), label_source: 'legend',
+                        classes: attr(el, 'class'), ctx: ctxOf(el), data: dataOf(el),
+                        aria_label: '', labelledby: '', min: '', max: '', maxlength: '',
+                        inputmode: '', options: [], invalid: false, message: '' };
+        fields.push(radios[key]);
+      }
+      radios[key].options.push({ idx: i, value: el.value, label });
+      radios[key].invalid = radios[key].invalid || invalid;
+      return;
+    }
+    const a = n => el.getAttribute(n) || '';
+    const f = { kind: type, idx: i, name: a('name'), id: el.id || '',
+                placeholder: a('placeholder'), autocomplete: a('autocomplete'),
+                label, label_source: source, options: [],
+                classes: attr(el, 'class'), ctx: ctxOf(el), data: dataOf(el),
+                inputmode: a('inputmode'),
+                aria_label: clean(a('aria-label')), labelledby: ariaLabelled(el),
+                maxlength: a('maxlength'), minlength: a('minlength'),
+                min: a('min'), max: a('max'), pattern: a('pattern'),
+                required: el.required === true || a('aria-required') === 'true',
+                invalid, message: el.validationMessage || '' };
+    if (type === 'select')
+      f.options = [...el.options].map(o => ({ value: o.value, label: o.text }));
+    fields.push(f);
+  });
+  return fields;
+}
+"""
+
+ERROR_TEXT_JS = """
+() => [...document.querySelectorAll(
+  '[role=alert], .error, .errors, .invalid-feedback, .field-error, .form-error, .help-block.error')]
+  .filter(e => e.offsetWidth || e.offsetHeight)
+  .map(e => (e.textContent || '').replace(/\\s+/g, ' ').trim()).filter(Boolean).slice(0, 10)
+"""
+
+
+class CaptchaBlocked(Exception):
+    """A CAPTCHA was found and no human solved it."""
+
+
+def log(msg: str = "") -> None:
+    print(msg, flush=True)
+
+
+def norm(s) -> str:
+    """Lowercase, no diacritics, only letters and digits."""
+    s = unicodedata.normalize("NFKD", str(s)).encode("ascii", "ignore").decode()
+    return re.sub(r"[^a-z0-9]", "", s.lower())
+
+
+def similarity(a: str, b: str) -> float:
+    if not a or not b:
+        return 0.0
+    if a == b:
+        return 1.0
+    short, long_ = sorted((a, b), key=len)
+    if len(short) >= 4 and short in long_ and len(short) / len(long_) >= 0.5:
+        return 0.9  # e.g. "email" in "useremail"
+    return SequenceMatcher(None, a, b).ratio()
+
+
+# CSS classes that carry no meaning (layout / framework utilities / widget types).
+STRUCT_STOP = {
+    "input", "text", "field", "fields", "form", "control", "group", "wrapper", "wrap",
+    "container", "row", "col", "cols", "md", "lg", "sm", "xs", "xl", "btn", "button",
+    "required", "error", "valid", "invalid", "is", "has", "mb", "mt", "ml", "mr", "px",
+    "py", "pt", "pb", "w", "h", "full", "half", "item", "items", "label", "box", "block",
+    "inline", "flex", "grid", "hidden", "visible", "small", "large", "medium", "default",
+    "primary", "secondary", "custom", "select", "dropdown", "checkbox", "radio", "number",
+    "ui", "js", "no", "the", "and", "of", "for", "class", "focus", "active", "disabled",
+    "readonly", "placeholder", "floating", "outline", "border", "rounded", "shadow",
+    "style", "type", "element", "component", "widget", "entry", "line", "section", "step",
+    "inner", "outer", "content", "body", "main", "base", "root", "second",
+    # framework / naming-convention noise (ASP.NET, Django, WooCommerce, Rails, ...)
+    "txt", "ddl", "chk", "rb", "tb", "cbo", "lbl", "ctl", "maincontent", "id", "fields",
+    "values", "value", "data", "entry", "wpforms", "billing", "shipping", "account",
+    "customer", "model", "attributes", "params", "post",
+}
+# Visible-label vocabulary in other languages (hr, de, fr, es, it, pt, nl, pl).
+# Used only against label text, so opaque class/id/name values are never needed.
+I18N_LABELS = {
+    "firstname": ["ime", "vorname", "prenom", "nombre", "nome", "voornaam", "imie",
+                  "primeironome", "nombredepila"],
+    "lastname": ["prezime", "nachname", "familienname", "apellido", "apellidos", "cognome",
+                 "sobrenome", "achternaam", "nazwisko"],
+    "fullname": ["imeiprezime", "vollername", "nomcomplet", "nombrecompleto",
+                 "nomecompleto", "nomeecognome", "volledigenaam", "imieinazwisko"],
+    "email": ["eposta", "epost", "mail", "courriel", "correo", "correoelectronico",
+              "emailadresse", "indirizzoemail", "adresaeposte", "emailadres"],
+    "phone": ["telefon", "mobitel", "mobilni", "handy", "telefonnummer", "mobiltelefon",
+              "telephone", "portable", "telefono", "movil", "celular", "telefone",
+              "telefoon", "komorka", "brojmobitela", "brojtelefona"],
+    "password": ["lozinka", "sifra", "passwort", "kennwort", "motdepasse", "contrasena",
+                 "senha", "wachtwoord", "haslo"],
+    "username": ["korisnickoime", "korisnik", "benutzername", "nutzername", "identifiant",
+                 "usuario", "nomeutente", "gebruikersnaam", "uzytkownik"],
+    "birthdate": ["datumrodenja", "rodenje", "geburtsdatum", "datedenaissance",
+                  "fechadenacimiento", "datadinascita", "datadenascimento",
+                  "geboortedatum", "dataurodzenia"],
+    "gender": ["spol", "geschlecht", "sexe", "genre", "sexo", "genero", "sesso",
+               "geslacht", "plec"],
+    "city": ["grad", "mjesto", "stadt", "ort", "ville", "ciudad", "citta", "cidade",
+             "stad", "miasto"],
+    "country": ["drzava", "zemlja", "land", "pays", "pais", "paese", "kraj"],
+    "address": ["adresa", "ulica", "adresse", "strasse", "direccion", "calle", "indirizzo",
+                "via", "endereco", "straat"],
+    "message": ["poruka", "komentar", "napomena", "nachricht", "kommentar", "mensaje",
+                "comentario", "messaggio", "mensagem", "bericht", "wiadomosc"],
+    "company": ["tvrtka", "firma", "poduzece", "unternehmen", "entreprise", "empresa",
+                "azienda"],
+}
+EXACT_ONLY = {"name"}  # too generic to match as a part of another name (username, ...)
+LABEL_STOP = {"the", "your", "enter", "please", "select", "choose", "or", "and", "ili",
+              "odaberite", "odaberi", "unesite", "und", "oder", "ou", "o", "de", "la", "el"}
+HASHED = re.compile(r"^(css|sc|jsx|svelte|ember|_)?-?[a-z]{0,3}[0-9a-f]{5,}$")
+
+
+def _ascii(s) -> str:
+    return unicodedata.normalize("NFKD", str(s)).encode("ascii", "ignore").decode()
+
+
+def tokens(raw, stop=STRUCT_STOP) -> list[str]:
+    """Split camelCase / snake_case / kebab-case / spaces into lowercase words."""
+    t = re.sub(r"([a-z])([A-Z])", r"\1 \2", _ascii(raw))
+    out = []
+    for w in re.findall(r"[A-Za-z]+|\d+", t):
+        w = w.lower()
+        if len(w) < 2 or w in stop or w.isdigit() or HASHED.match(w):
+            continue
+        out.append(w)
+    return out
+
+
+def names_for(key: str, i18n: bool = False) -> list[str]:
+    names = [norm(key)] + ALIASES.get(norm(key), [])
+    if i18n:
+        names += I18N_LABELS.get(norm(key), [])
+    return names
+
+
+def struct_raws(f: dict) -> list[str]:
+    """Language independent strings: name, id, classes, data-*, wrapper classes, hints."""
+    ac = f.get("autocomplete", "").split()
+    ph = (f.get("placeholder") or "").strip()
+    shape = ("email" if re.fullmatch(r"\S+@\S+", ph)
+             else "phone" if re.fullmatch(r"\+?[\d\s().\-]{7,}", ph) else None)
+    hints = [AUTOCOMPLETE_HINTS.get(ac[-1]) if ac else None, KIND_HINTS.get(f["kind"]),
+             {"email": "email", "tel": "phone", "numeric": None}.get(f.get("inputmode", "")),
+             shape]
+    raw = [f.get("name"), f.get("id"), f.get("classes"), f.get("data"),
+           f.get("ctx"), f.get("placeholder"), *hints]
+    return [r for r in raw if r]
+
+
+def label_raws(f: dict) -> list[str]:
+    return [r for r in (f.get("label"),) if r]
+
+
+def _name_score(raws: list[str], names: list[str], stop=STRUCT_STOP) -> float:
+    best = 0.0
+    for raw in raws:
+        whole = norm(raw)
+        toks = tokens(raw, stop)
+        for n in names:
+            if n in EXACT_ONLY:
+                best = max(best, 1.0 if whole == n else 0.0)
+                continue
+            s = similarity(whole, n)
+            for t in toks:
+                s = max(s, 0.9 * similarity(t, n))
+            if len(n) >= 5 and len(whole) > len(n) and n in whole:
+                s = max(s, min(0.95, 0.8 + 0.01 * len(n)))
+            best = max(best, s)
+    return best
+
+
+# Signals, most reliable first (weight = how far a match on that tier is trusted).
+TIER_WEIGHTS = [
+    ("autocomplete", 1.00), ("name", 0.98), ("id", 0.96), ("type", 0.94),
+    ("aria-label", 0.91), ("aria-labelledby", 0.88), ("placeholder", 0.85),
+    ("class", 0.83), ("text", 0.80),
+]
+INPUTMODE_HINTS = {"email": "email", "tel": "phone"}
+LANGUAGE_TIERS = {"aria-label", "aria-labelledby", "placeholder", "text"}
+
+
+def tier_signals(f: dict) -> dict[str, list[str]]:
+    """The raw strings of every tier for one field."""
+    ac = f.get("autocomplete", "").split()
+    ph = (f.get("placeholder") or "").strip()
+    shape = ("email" if re.fullmatch(r"\S+@\S+", ph)
+             else "phone" if re.fullmatch(r"\+?[\d\s().\-]{7,}", ph) else None)
+    src = f.get("label_source", "")
+    aria = [f.get("aria_label")] + ([f["label"]] if src == "title" else [])
+    text = [] if src in ("aria-label", "aria-labelledby", "title") else [f.get("label")]
+    sig = {
+        "autocomplete": [AUTOCOMPLETE_HINTS.get(ac[-1]) if ac else None],
+        "name": [f.get("name")],
+        "id": [f.get("id")],
+        "type": [KIND_HINTS.get(f["kind"]), INPUTMODE_HINTS.get(f.get("inputmode", ""))],
+        "aria-label": aria,
+        "aria-labelledby": [f.get("labelledby")],
+        "placeholder": [ph, shape],
+        "class": [f.get("classes"), f.get("data"), f.get("ctx")],
+        "text": text,
+    }
+    return {k: [r for r in v if r] for k, v in sig.items()}
+
+
+def score_field_key(f: dict, key: str):
+    """(score, tier). A match is worth the weight of the tier it was found in."""
+    sig = tier_signals(f)
+    best, best_tier = 0.0, ""
+    for tier, weight in TIER_WEIGHTS:
+        raws = sig.get(tier)
+        if not raws:
+            continue
+        stop = LABEL_STOP if tier in LANGUAGE_TIERS else STRUCT_STOP
+        raw_score = _name_score(raws, names_for(key, i18n=tier in LANGUAGE_TIERS), stop)
+        if raw_score * weight > best:
+            best, best_tier = raw_score * weight, tier
+    return best, best_tier
+
+
+def compatible(f: dict, value) -> bool:
+    """Reject values that cannot go into this input type (e.g. a street in an email box)."""
+    v, k = str(value), f["kind"]
+    if k == "email":
+        return "@" in v
+    if k == "tel":
+        return bool(re.fullmatch(r"[+\d\s().\-]{5,}", v))
+    if k in ("number", "range"):
+        return bool(re.fullmatch(r"-?\d+([.,]\d+)?", v))
+    if k == "date":
+        return bool(re.fullmatch(r"\d{4}-\d{2}-\d{2}", v))
+    return True
+
+
+def assign_keys(fields: list[dict], record: dict, skip: set) -> dict:
+    """Global assignment {field index: (key, score, source)}; strongest pairs first.
+
+    Pass 1 uses every key once. Pass 2 lets an already used key fill further fields
+    only on a near-exact match (e.g. a repeated e-mail confirmation box).
+    """
+    cands = []
+    for i, f in enumerate(fields):
+        if i in skip:
+            continue
+        for key, value in record.items():
+            s, src = score_field_key(f, key)
+            if s >= THRESHOLD and compatible(f, value):
+                cands.append((s, i, key, src))
+    cands.sort(key=lambda c: (-c[0], c[1]))
+    out, used = {}, set()
+    for s, i, key, src in cands:
+        if i not in out and key not in used:
+            out[i] = (key, s, src)
+            used.add(key)
+    for s, i, key, src in cands:
+        if i not in out and s >= 0.8:
+            out[i] = (key, s, src)
+    return out
+
+
+# ---- birth date split over day / month / year selects -----------------------
+PART_WORDS = {  # English + Croatian (+ a little German) words for the three parts
+    "day": {"day", "dd", "dy", "dan", "dani", "tag"},
+    "month": {"month", "mm", "mon", "mjesec", "mjeseca", "mj", "monat"},
+    "year": {"year", "yyyy", "yy", "godina", "godinu", "godine", "god", "gggg", "jahr"},
+}
+
+
+CARD_WORDS = {"exp", "expiry", "expiration", "expires", "expire", "card", "cc", "cvv",
+              "cvc", "valid", "validity"}
+
+
+def _parts_or_words(raws, words) -> bool:
+    return any(t in words for raw in raws if raw for t in tokens(raw, stop=set()))
+
+
+def _parts_in(raws) -> set[str]:
+    found = set()
+    for raw in raws:
+        for t in tokens(raw, stop=set()):
+            for part, words in PART_WORDS.items():
+                if t in words:
+                    found.add(part)
+    return found
+
+
+def _int(v):
+    try:
+        return int(str(v).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def date_part(f: dict):
+    """(part, strong) for day / month / year fields of any kind, else None.
+
+    strong = decided by words in the HTML; weak = guessed from numeric ranges, which
+    is only trusted when at least two parts of a date are present on the page.
+    """
+    if f["kind"] not in ("select", "text", "number", "tel", "combobox"):
+        return None
+    own = [f.get(k) for k in ("name", "id", "aria_label", "labelledby", "placeholder",
+                              "classes", "data", "label")]
+    if _parts_or_words(own + [f.get("ctx")], CARD_WORDS):  # card expiry etc., not a birth date
+        return None
+    parts = _parts_in([r for r in own if r])
+    if len(parts) == 1:
+        return parts.pop(), True
+    if not parts:
+        ctx = _parts_in([f["ctx"]] if f.get("ctx") else [])
+        if len(ctx) == 1:
+            return ctx.pop(), True
+    if f["kind"] in ("number", "text", "tel"):
+        mn, mx = _int(f.get("min")), _int(f.get("max"))
+        if mn == 1 and mx == 31:
+            return "day", False
+        if mn == 1 and mx == 12:
+            return "month", False
+        if mn is not None and mn >= 1900:
+            return "year", False
+    if f["kind"] == "select":
+        texts = [(o["value"] or o["label"]).strip() for o in f["options"]]
+        nums = [int(t) for t in texts if re.fullmatch(r"\d{1,4}", t) and int(t) > 0]
+        if len(nums) >= 28 and min(nums) == 1 and 28 <= max(nums) <= 31:
+            return "day", False
+        if len(nums) >= 20 and min(nums) >= 1900:
+            return "year", False
+        if sorted(nums) == list(range(1, 13)):
+            return "month", False
+    return None
+
+
+def detect_date_parts(fields: list[dict], date_src) -> dict:
+    """{field index: part}. A date is split only if the page really has at least two of
+    its parts (day / month / year); a single date field is always filled as a whole."""
+    if not date_src:
+        return {}
+    cand = {n: r for n, f in enumerate(fields) if (r := date_part(f))}
+    present = {part for part, _ in cand.values()}
+    if len(present) < 2:
+        return {}
+    return {n: part for n, (part, _strong) in cand.items()}
+
+
+def date_value(record: dict):
+    """(key, (year, month, day)) from the first date-like value; birth-ish keys first."""
+    found = []
+    for key, v in record.items():
+        v = str(v).strip()
+        m = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", v)
+        ymd = (int(m[1]), int(m[2]), int(m[3])) if m else None
+        if not ymd and (m := re.fullmatch(r"(\d{1,2})[./-](\d{1,2})[./-](\d{4})", v)):
+            ymd = (int(m[3]), int(m[2]), int(m[1]))
+        if ymd:
+            birthish = bool(re.search(r"birth|dob|bday|date|datum", norm(key)))
+            found.append((not birthish, key, ymd))
+    found.sort(key=lambda t: t[0])
+    return (found[0][1], found[0][2]) if found else None
+
+
+def fill_date_part(f: dict, part: str, ymd) -> str:
+    want = {"year": ymd[0], "month": ymd[1], "day": ymd[2]}[part]
+    if f["kind"] != "select":  # text / number / custom dropdown
+        ph = (f.get("placeholder") or "").lower()
+        ml = _int(f.get("maxlength"))
+        if part == "year":
+            two = ml == 2 or (("yy" in ph or "gg" in ph) and "yyyy" not in ph
+                              and "gggg" not in ph)
+            text = f"{want % 100:02d}" if two else str(want)
+        else:
+            text = f"{want:02d}" if (ml == 2 or ph in ("dd", "mm", "dd.", "mm.")) else str(want)
+        return fill_field(f, text).replace(" -> ", f"({part}) -> ", 1)
+    opts = [o for o in f["options"] if (o["value"] or "").strip() != ""]
+    chosen = None
+    for o in opts:
+        for t in (o["value"], o["label"]):
+            if re.fullmatch(r"\s*0*\d{1,4}\s*", t or "") and int(t) == want:
+                chosen = o
+                break
+        if chosen:
+            break
+    if chosen is None and part == "month" and len(opts) == 12:
+        chosen = opts[want - 1]  # month names in any language: positional
+    if chosen is None:
+        return f"no option for {part}={want}"
+    field_locator(f).select_option(value=chosen["value"])
+    return f"select({part}) -> {chosen['label'] or chosen['value']}"
+
+
+SYN_GROUPS = [
+    {"female", "f", "woman", "zensko", "zena", "zenski", "weiblich", "femme", "mujer",
+     "donna", "feminino"},
+    {"male", "m", "man", "musko", "muski", "maennlich", "mannlich", "homme", "hombre",
+     "uomo", "masculino"},
+    {"yes", "y", "true", "da", "ja", "oui", "si", "sim"},
+    {"no", "n", "false", "ne", "nein", "non", "nao"},
+]
+
+
+def pick_option(options: list[dict], value) -> dict | None:
+    """Choose an option (select/radio/combobox) by value or label (with synonyms)."""
+    target = norm(value)
+    targets = {target}
+    for g in SYN_GROUPS:
+        if target in g:
+            targets |= g
+    scored = [(max(similarity(t, norm(o["value"])) for t in targets) if o["value"] else 0.0,
+               o) for o in options]
+    scored = [(max(sv, max(similarity(t, norm(o["label"])) for t in targets)), o)
+              for sv, o in scored]
+    score, opt = max(scored, key=lambda t: t[0], default=(0, None))
+    return opt if score >= THRESHOLD else None
+
+
+def adapt_value(f: dict, value) -> str:
+    """Fit a value to the field: date placeholder formats and maxlength."""
+    s = str(value)
+    ph = f.get("placeholder", "").lower()
+    if (re.fullmatch(r"\d{4}-\d{2}-\d{2}", s) and f["kind"] in ("text", "search")
+            and re.search(r"[dmy]", ph)):
+        y, m, d = s.split("-")
+        order = []
+        for ch in re.findall(r"[dmy]", ph):
+            if ch not in order:
+                order.append(ch)
+        if len(order) == 3:
+            sep = next((c for c in ph if not c.isalnum()), "/")
+            parts = {"d": d, "m": m, "y": y if "yyyy" in ph else y[2:]}
+            s = sep.join(parts[c] for c in order)
+    try:
+        mx = int(f.get("maxlength") or -1)
+    except ValueError:
+        mx = -1
+    return s[:mx] if mx >= 0 else s
+
+
+def discover(page: Page) -> list[dict]:
+    """Fields from the main document and every iframe (each carries its frame)."""
+    fields = []
+    for fr in page.frames:
+        try:
+            found = fr.evaluate(DISCOVER_JS)
+        except Exception:  # frame detached / not reachable
+            continue
+        for f in found:
+            f["frame"] = fr
+            f["in_iframe"] = fr != page.main_frame
+        fields.extend(found)
+    return fields
+
+
+def field_locator(f: dict):
+    return f["frame"].locator(f'[data-ff-idx="{f["idx"]}"]')
+
+
+def fill_combobox(fr: Frame, loc, value) -> str:
+    """Custom dropdown: click, (type if it is an input), then click the option."""
+    loc.click()
+    is_input = loc.evaluate("e => e.tagName") == "INPUT"
+    if is_input:
+        loc.fill(str(value))
+    fr.page.wait_for_timeout(250)
+    visible = []
+    for scope in (fr, fr.page.main_frame):  # the popup may live in a portal
+        visible = [o for o in scope.locator("[role=option], [role=listbox] li").all()
+                   if o.is_visible()]
+        if visible:
+            break
+    cands = [{"idx": i, "label": o.inner_text().strip(), "value": ""}
+             for i, o in enumerate(visible)]
+    opt = pick_option(cands, value)
+    if opt:
+        visible[opt["idx"]].click()
+        return f"combobox -> {opt['label']}"
+    if is_input:
+        loc.press("Enter")
+        return f"combobox (typed + Enter) -> {value}"
+    return f"no option for '{value}'"
+
+
+def _set_checked(loc, desired: bool = True) -> None:
+    """Check/uncheck, also for visually hidden (styled) checkboxes and radios."""
+    try:
+        loc.set_checked(desired, timeout=2000)
+        return
+    except Exception:
+        pass
+    try:
+        loc.set_checked(desired, force=True, timeout=2000)
+    except Exception:
+        loc.evaluate("(e, v) => { if (e.checked !== v) e.click(); }", desired)
+
+
+def fill_field(f: dict, value) -> str:
+    fr: Frame = f["frame"]
+    kind = f["kind"]
+    if kind == "radio":
+        opt = pick_option(f["options"], value)
+        if not opt:
+            return f"no option for '{value}'"
+        _set_checked(fr.locator(f'[data-ff-idx="{opt["idx"]}"]'))
+        return f"radio -> {opt['label'] or opt['value']}"
+    loc = field_locator(f)
+    if kind == "file":
+        path = Path(str(value)).expanduser()
+        if not path.is_absolute():
+            path = (BASE / path) if (BASE / path).exists() else path.resolve()
+        if not path.exists():
+            return f"file not found: {value}"
+        loc.set_input_files(str(path))
+        return f"file -> {path.name}"
+    if kind == "combobox":
+        return fill_combobox(fr, loc, value)
+    if kind == "checkbox":
+        truthy = str(value).strip().lower() in ("1", "true", "yes", "y", "x", "on")
+        _set_checked(loc, truthy)
+        return f"checkbox -> {truthy}"
+    if kind == "select":
+        opt = pick_option(f["options"], value)
+        if not opt:
+            return f"no option for '{value}'"
+        loc.select_option(value=opt["value"])
+        return f"select -> {opt['label']}"
+    text = adapt_value(f, value)
+    try:
+        loc.fill(text)
+    except Exception:
+        if kind != "textbox":
+            raise
+        loc.click()  # non-editable role=textbox widgets: type like a user
+        fr.page.keyboard.type(text)
+    return f"{kind} -> {text}"
+
+
+def iter_buttons(page: Page):
+    """Yield (locator, normalized_text, type) for visible, enabled buttons."""
+    for fr in page.frames:
+        try:
+            buttons = fr.locator(
+                "button, input[type=button], input[type=submit], "
+                "[role=button]:not([aria-haspopup])").all()
+        except Exception:
+            continue
+        for btn in buttons:
+            if not btn.is_visible() or not btn.is_enabled():
+                continue
+            text = norm(btn.inner_text() or btn.get_attribute("value") or "")
+            yield btn, text, btn.evaluate("e => e.type")
+
+
+def is_next(text: str) -> bool:
+    return text.startswith(tuple(norm(w) for w in CFG.next_words))
+
+
+def find_next(page: Page):
+    """Find a 'Next / Continue' button."""
+    if CFG.next_selector:
+        for fr in page.frames:
+            for el in fr.locator(CFG.next_selector).all():
+                if el.is_visible() and el.is_enabled():
+                    return el
+    for btn, text, _ in iter_buttons(page):
+        if is_next(text):
+            return btn
+    return None
+
+
+def find_submit(page: Page):
+    """Find the submit button: custom selector > type=submit > submit-like text."""
+    if CFG.submit_selector:
+        for fr in page.frames:
+            for el in fr.locator(CFG.submit_selector).all():
+                if el.is_visible() and el.is_enabled():
+                    return el
+    words = tuple(norm(w) for w in CFG.submit_words)
+    by_text = None
+    for btn, text, typ in iter_buttons(page):
+        if is_next(text):
+            continue
+        if typ == "submit":
+            return btn
+        if by_text is None and text.startswith(words):
+            by_text = btn
+    return by_text
+
+
+def captcha_present(page: Page) -> bool:
+    for fr in page.frames:
+        try:
+            if fr.locator(CAPTCHA_SELECTOR).count():
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def captcha_solved(page: Page) -> bool:
+    """reCAPTCHA / hCaptcha / Turnstile fill a hidden *-response field once solved."""
+    for fr in page.frames:
+        try:
+            if fr.evaluate("() => [...document.querySelectorAll("
+                           "'textarea[name$=response], input[name$=response]')]"
+                           ".some(e => e.value && e.value.length > 20)"):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def wait_for_human_captcha(page: Page) -> None:
+    """CAPTCHAs are NOT bypassed: the script stops and waits for a human."""
+    if not captcha_present(page):
+        return
+    if CFG.headless:
+        raise CaptchaBlocked("CAPTCHA found; run without headless to solve it manually.")
+    page.bring_to_front()
+    if CFG.interactive:
+        input("  CAPTCHA found. Solve it manually in the browser, then press Enter...")
+        return
+    log(f"  CAPTCHA found. Solve it in the browser window "
+        f"(waiting up to {CFG.captcha_timeout}s)...")
+    waited = 0
+    while waited < CFG.captcha_timeout:
+        if captcha_solved(page):
+            log("  CAPTCHA solved, continuing.")
+            return
+        page.wait_for_timeout(1000)
+        waited += 1
+    raise CaptchaBlocked("CAPTCHA was not solved in time.")
+
+
+# Well-known consent-management platforms (OneTrust, Cookiebot, Didomi, ...).
+CMP_SELECTORS = {
+    "accept": [
+        "#onetrust-accept-btn-handler",
+        "#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll",
+        "#CybotCookiebotDialogBodyButtonAccept",
+        "#didomi-notice-agree-button",
+        ".qc-cmp2-summary-buttons button[mode=primary]",
+        "[data-testid=uc-accept-all-button]",
+        ".cmplz-accept", ".cc-allow", ".cc-btn.cc-dismiss", ".osano-cm-accept-all",
+        "#truste-consent-button", ".fc-cta-consent",
+    ],
+    "reject": [
+        "#onetrust-reject-all-handler",
+        "#CybotCookiebotDialogBodyButtonDecline",
+        "#didomi-notice-disagree-button",
+        "[data-testid=uc-deny-all-button]",
+        ".cmplz-deny", ".osano-cm-deny", ".cc-deny",
+    ],
+}
+# Generic banners: only buttons inside containers that look like consent dialogs.
+CONSENT_CONTAINERS = (
+    ":is([id*=cookie i], [class*=cookie i], [id*=consent i], [class*=consent i], "
+    "[id*=gdpr i], [class*=gdpr i], [aria-label*=cookie i], [aria-label*=consent i], "
+    "[role=dialog], [role=alertdialog])")
+CONSENT_BUTTONS = ":is(button, a, [role=button], input[type=button], input[type=submit])"
+ACCEPT_STARTS = ("accept", "agree", "allow", "iagree", "iaccept", "gotit", "understand",
+                 "prihvati", "prihvacam", "slazemse", "uredu", "razumijem", "dopusti")
+NOT_ACCEPT = ("reject", "decline", "deny", "refuse", "necessary", "essential", "only",
+              "manage", "setting", "preference", "custom", "odbij", "postavk", "samo")
+REJECT_PARTS = ("reject", "decline", "deny", "refuse", "necessaryonly", "onlynecessary",
+                "essentialonly", "onlyessential", "odbij", "odbi")
+
+
+def _cookie_button_text(btn) -> str:
+    return norm(btn.inner_text() or btn.get_attribute("value") or "")
+
+
+def _click_cookie_button(page: Page, mode: str) -> str | None:
+    for sel in CMP_SELECTORS[mode]:
+        for fr in page.frames:
+            try:
+                loc = fr.locator(sel).first
+                if loc.count() and loc.is_visible():
+                    label = (loc.inner_text() or sel).strip()[:40]
+                    loc.click(timeout=2000)
+                    return label
+            except Exception:
+                continue
+    for fr in page.frames:
+        try:
+            buttons = fr.locator(f"{CONSENT_CONTAINERS} {CONSENT_BUTTONS}").all()
+        except Exception:
+            continue
+        for btn in buttons:
+            try:
+                if not btn.is_visible():
+                    continue
+                text = _cookie_button_text(btn)
+                if not text or len(text) > 40:
+                    continue
+                if mode == "accept":
+                    hit = (text == "ok" or text.startswith(ACCEPT_STARTS)) \
+                        and not any(w in text for w in NOT_ACCEPT)
+                else:
+                    hit = any(w in text for w in REJECT_PARTS)
+                if hit:
+                    label = (btn.inner_text() or btn.get_attribute("value") or "").strip()
+                    btn.click(timeout=2000)
+                    return label[:40]
+            except Exception:
+                continue
+    return None
+
+
+def handle_cookies(page: Page) -> None:
+    """Accept or reject a cookie banner if one shows up (banners often appear late)."""
+    mode = CFG.cookies
+    if mode == "ignore":
+        return
+    for attempt in range(4):
+        clicked = _click_cookie_button(page, mode)
+        if clicked:
+            done = "accepted" if mode == "accept" else "rejected"
+            log(f"  Cookie banner {done} via {clicked!r}")
+            page.wait_for_timeout(300)
+            return
+        if attempt < 3:
+            page.wait_for_timeout(500)
+
+
+def highlight(f: dict, color: str) -> None:
+    """Outline the field and scroll it into view so a human can follow along."""
+    if CFG.headless or not CFG.highlight:
+        return
+    try:
+        field_locator(f).evaluate(
+            "(e, c) => { e.scrollIntoView({block: 'center'});"
+            " e.style.outline = '3px solid ' + c; e.style.outlineOffset = '2px'; }",
+            color)
+    except Exception:
+        pass
+
+
+def composite_values(record: dict) -> tuple[dict, dict]:
+    """Virtual keys built from real ones, e.g. full_name = first_name + last_name."""
+    first = next((k for k in record if norm(k) in ("firstname", "givenname", "fname")), None)
+    last = next((k for k in record if norm(k) in ("lastname", "surname", "lname")), None)
+    has_full = any(norm(k) in ("fullname", "name") for k in record)
+    if first and last and not has_full:
+        return ({"full_name": f"{record[first]} {record[last]}"},
+                {"full_name": (first, last)})
+    return {}, {}
+
+
+def apply_map(fields: list[dict], record: dict) -> dict:
+    """Manual overrides: {css selector: data key | "=literal value"} -> {field index: (key, value)}."""
+    out = {}
+    for sel, target in CFG.field_map.items():
+        literal = isinstance(target, str) and target.startswith("=")
+        if not literal and target not in record:
+            continue
+        value = target[1:] if literal else record[target]
+        for fr in {f["frame"] for f in fields}:
+            try:
+                idxs = fr.evaluate(
+                    "sel => [...document.querySelectorAll(sel)]"
+                    ".map(e => e.getAttribute('data-ff-idx'))", sel)
+            except Exception:
+                continue
+            for n, f in enumerate(fields):
+                if f["frame"] == fr and str(f["idx"]) in [str(i) for i in idxs if i]:
+                    out[n] = ("<literal>" if literal else target, value)
+    return out
+
+
+def top_candidates(f: dict, keys: list[str], n: int = 3) -> list[dict]:
+    rows = []
+    for k in keys:
+        sc, src = score_field_key(f, k)
+        rows.append({"key": k, "score": round(sc, 2), "source": src})
+    rows.sort(key=lambda r: -r["score"])
+    return rows[:n]
+
+
+def describe(f: dict) -> dict:
+    return {"kind": f["kind"], "name": f["name"], "id": f["id"], "class": f.get("classes", ""),
+            "data": f.get("data", ""), "ctx": f.get("ctx", ""), "label": f["label"],
+            "label_source": f["label_source"], "placeholder": f["placeholder"],
+            "autocomplete": f.get("autocomplete", ""), "options": len(f.get("options", [])),
+            "required": f.get("required", False), "in_iframe": f.get("in_iframe", False)}
+
+
+def inspect_page(page: Page, record: dict) -> list[dict]:
+    """List every field with the signals read from the page and its best data keys."""
+    fields = discover(page)
+    record = {**record, **composite_values(record)[0]}
+    keys = list(record.keys()) or list(ALIASES.keys())
+    log(f"  Fields found: {len(fields)}")
+    out = []
+    for n, f in enumerate(fields, 1):
+        info = describe(f)
+        info["top"] = top_candidates(f, keys)
+        dp = date_part(f)
+        info["part"] = dp[0] if dp else None
+        out.append(info)
+        best = info["top"][0] if info["top"] else None
+        verdict = (f"{best['key']!r} ({best['score']:.2f} {best['source']})"
+                   if best and best["score"] >= THRESHOLD else "no match")
+        log(f"  {n:2}. <{info['kind']}> name={info['name']!r} id={info['id']!r} "
+            f"label={info['label']!r} [{info['label_source']}]")
+        log(f"      class={info['class'][:50]!r} ctx={info['ctx'][:40]!r} "
+            f"data={info['data'][:40]!r}")
+        log(f"      -> {verdict}" + (f"  date-part={info['part']}" if info["part"] else ""))
+    return out
+
+
+def fill_step(page: Page, record: dict, used: set, entries: list, gen: DataGen):
+    fields = discover(page)
+    last = None
+    log(f"  Fields found: {len(fields)}")
+    extras, comp_src = composite_values(record)
+    record = {**record, **extras}
+    date_src = date_value(record)
+    parts = detect_date_parts(fields, date_src)
+    fixed = apply_map(fields, record)
+    assigned = assign_keys(fields, record, skip=set(parts) | set(fixed))
+    if CFG.debug:
+        for n, f in enumerate(fields):
+            d = describe(f)
+            log(f"    . {n}: {d['kind']} name={d['name']!r} id={d['id']!r} "
+                f"class={d['class'][:40]!r} label={d['label']!r}[{d['label_source']}]")
+            log(f"      top: {top_candidates(f, list(record.keys()))}")
+    for n, f in enumerate(fields):
+        title = f["label"] or f["name"] or f["id"] or f["placeholder"] or f["kind"]
+        ident = f["name"] or f["id"] or f["kind"]
+        where = " [iframe]" if f["in_iframe"] else ""
+        if n in parts:
+            key = date_src[0]
+            used.add(key)
+            highlight(f, "#ff9800")
+            result = fill_date_part(f, parts[n], date_src[1])
+            highlight(f, "#4caf50")
+            score, src = 1.0, "date-part"
+            last = f
+        elif n in fixed:
+            key, value = fixed[n]
+            used.add(key)
+            highlight(f, "#ff9800")
+            result = fill_field(f, value)
+            highlight(f, "#4caf50")
+            score, src = 1.0, "map"
+            last = f
+        elif n in assigned:
+            key, score, how = assigned[n]
+            used.add(key)
+            used.update(comp_src.get(key, ()))
+            highlight(f, "#ff9800")
+            result = fill_field(f, record[key])
+            highlight(f, "#4caf50")
+            src = f"{how} {score:.2f}"
+            last = f
+        elif CFG.fake_missing and (value := gen.generate(f)) is not None:
+            highlight(f, "#ff9800")
+            result = fill_field(f, value)
+            highlight(f, "#4caf50")
+            key, score, src = "<generated>", 0.0, "faker"
+            last = f
+        else:
+            log(f"  [ - ] {title[:22]!r:24} <{ident[:20]}> no data{where}")
+            continue
+        entries.append({"field": title, "label_source": f["label_source"], "key": key,
+                        "score": round(score, 2), "source": src, "result": result})
+        log(f"  [ + ] {title[:22]!r:24} <{ident[:20]}> <- {key!r} ({src}): "
+            f"{result}{where}")
+    return fields, last
+
+
+def submit_form(page: Page, last_field) -> dict:
+    """Click submit (or fall back to form.requestSubmit / Enter); report validation."""
+    method = None
+    btn = find_submit(page)
+    if btn:
+        label = (btn.inner_text() or btn.get_attribute("value") or "").strip()
+        btn.click()
+        method = f"clicked button {label!r}"
+    elif last_field is not None:
+        loc = field_locator(last_field)
+        if loc.evaluate("e => e.form ? (e.form.requestSubmit(), true) : false"):
+            method = "form.requestSubmit()"
+        else:
+            loc.press("Enter")
+            method = "pressed Enter in last field"
+    if method is None:
+        log("  No submit button found.")
+        return {"submitted": False, "method": None, "invalid": [], "page_errors": []}
+    try:
+        page.wait_for_load_state("load", timeout=3000)
+    except Exception:
+        pass
+    page.wait_for_timeout(500)
+    invalid = [f for f in discover(page) if f["invalid"]]
+    errors = []
+    for fr in page.frames:
+        try:
+            errors += fr.evaluate(ERROR_TEXT_JS)
+        except Exception:
+            continue
+    names = [f["label"] or f["name"] or f["id"] for f in invalid]
+    if invalid:
+        log(f"  Submit sent ({method}) but fields are invalid: {names}")
+    else:
+        log(f"  Form submitted ({method}).")
+    return {"submitted": not invalid, "method": method, "invalid": invalid,
+            "page_errors": errors}
+
+
+def fix_invalid(invalid: list[dict], gen: DataGen, entries: list) -> int:
+    """Replace values of invalid fields with generated ones that fit their constraints."""
+    fixed = 0
+    for f in invalid:
+        value = gen.generate(f)
+        if value is None:
+            continue
+        result = fill_field(f, value)
+        title = f["label"] or f["name"] or f["id"]
+        entries.append({"field": title, "label_source": f["label_source"],
+                        "key": "<retry>", "score": 0.0, "result": result,
+                        "reason": f["message"]})
+        log(f"  [ ~ ] {title[:26]!r:28} retry: {result}  ({f['message'] or 'invalid'})")
+        fixed += 1
+    return fixed
+
+
+def fill_record(page: Page, record: dict, gen: DataGen) -> dict:
+    record = {k: v for k, v in record.items() if not k.startswith("_")}
+    used: set = set()
+    entries: list = []
+    prev_sig = None
+    last = None
+    for step in range(1, MAX_STEPS + 1):
+        log(f" Step {step}")
+        fields, last_here = fill_step(page, record, used, entries, gen)
+        last = last_here or last
+        sig = [(f["kind"], f["name"], f["id"], f["label"]) for f in fields]
+        if sig == prev_sig:
+            log("  Same step as before (validation?), stopping.")
+            break
+        prev_sig = sig
+        wait_for_human_captcha(page)
+        nxt = find_next(page)
+        if nxt:
+            nxt.click()
+            page.wait_for_timeout(400)  # let the next step render
+            continue
+        break
+    unused = [k for k in record if k not in used]
+    if unused:
+        log(f"  Unused keys: {unused}")
+    result = {"filled": entries, "unused_keys": unused, "submitted": False,
+              "method": None, "invalid_fields": [], "page_errors": [], "attempts": 0}
+    if CFG.submit:
+        wait_for_human_captcha(page)
+        for attempt in range(CFG.retries + 1):
+            res = submit_form(page, last)
+            result.update(submitted=res["submitted"], method=res["method"],
+                          page_errors=res["page_errors"], attempts=attempt + 1)
+            result["invalid_fields"] = [
+                {"field": f["label"] or f["name"] or f["id"], "message": f["message"]}
+                for f in res["invalid"]]
+            if not res["invalid"] or attempt == CFG.retries:
+                break
+            if not fix_invalid(res["invalid"], gen, entries):
+                break
+    return result
+
+
+def login(page: Page, account: dict, default_url: str | None, gen: DataGen) -> None:
+    """Log in with the same dynamic mechanism; the session stays in this context."""
+    url = account.get("login_url") or default_url
+    if not url:
+        raise ValueError(f"No login URL for account {account['label']!r}")
+    log(f"\nLogin as {account['label']!r}: {url}")
+    page.goto(to_file_uri_if_path(url))
+    handle_cookies(page)
+    saved = CFG.submit
+    CFG.submit = True
+    try:
+        fill_record(page, account["creds"], gen)
+    finally:
+        CFG.submit = saved
+    page.wait_for_load_state()
+    page.wait_for_timeout(500)
+
+
+def append_jsonl(path: Path, result: dict) -> None:
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(result, ensure_ascii=False) + "\n")
+
+
+def run_session(task: dict) -> list[dict]:
+    """One browser session: optional login, then a list of jobs. Runs in a worker."""
+    global CFG
+    CFG = task["cfg"]
+    out: Path = CFG.out
+    gen = DataGen(CFG.faker_locale)
+    account = task["account"]
+    results = []
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=CFG.headless, slow_mo=CFG.slow)
+        context = browser.new_context()
+        page = context.new_page()
+        login_failed = None
+        if account:
+            try:
+                login(page, account, task["default_login_url"], gen)
+            except Exception as e:  # noqa: BLE001 - report and skip this account
+                login_failed = f"login failed: {e}"
+                log(f"  {login_failed}")
+        for job in task["jobs"]:
+            res = {"job": job["id"], "account": account["label"] if account else None,
+                   "url": job["url"], "row": job["row"], "status": "error", "error": None}
+            log(f"\nJob {job['id']} | {job['url']} | row {job['row']}"
+                + (f" | {account['label']}" if account else ""))
+            try:
+                if login_failed:
+                    raise RuntimeError(login_failed)
+                page.goto(to_file_uri_if_path(job["url"]))
+                handle_cookies(page)
+                if CFG.inspect:
+                    res["fields"] = inspect_page(page, job["record"])
+                    res["status"] = "inspected"
+                    res["final_url"] = page.url
+                else:
+                    res.update(fill_record(page, job["record"], gen))
+                    res["final_url"] = page.url
+                    if CFG.submit:
+                        res["status"] = "submitted" if res["submitted"] else "not-submitted"
+                    else:
+                        res["status"] = "filled"
+            except CaptchaBlocked as e:
+                res.update(status="captcha", error=str(e))
+                log(f"  Skipped: {e}")
+            except Exception as e:  # noqa: BLE001 - keep the batch going
+                res.update(status="error", error=f"{type(e).__name__}: {e}")
+                log(f"  Error: {res['error']}")
+            try:
+                shot = out / f"job_{job['id']:03d}.png"
+                page.screenshot(path=str(shot), full_page=True)
+                res["screenshot"] = shot.name
+            except Exception:
+                pass
+            append_jsonl(out / "report.jsonl", res)
+            results.append(res)
+            if not CFG.headless and CFG.job_pause > 0:
+                page.wait_for_timeout(int(CFG.job_pause * 1000))
+        if not CFG.headless:
+            if CFG.hold is None and CFG.interactive:
+                input("\nDone. Press Enter to close the browser...")
+            else:
+                secs = CFG.hold if CFG.hold is not None else 15
+                if secs > 0:
+                    log(f"\nKeeping the browser open for {secs:g}s...")
+                    page.wait_for_timeout(int(secs * 1000))
+        context.close()
+        browser.close()
+    return results
+
+
+def build_jobs(urls: list[str], records: list[dict], mode: str) -> list[dict]:
+    """all = every URL x every row (a row's `_url` overrides); pair = url[i] with row[i]."""
+    jobs = []
+
+    def add(url, rec, row):
+        jobs.append({"id": len(jobs) + 1, "url": rec.get("_url") or url,
+                     "record": rec, "row": row})
+
+    if mode == "pair":
+        for i, rec in enumerate(records):
+            add(urls[i % len(urls)], rec, i + 1)
+    else:
+        for url in urls:
+            for i, rec in enumerate(records):
+                if rec.get("_url") and url != urls[0]:
+                    continue  # a row with its own _url is run only once
+                add(url, rec, i + 1)
+    return jobs
+
+
+def main() -> None:
+    global CFG
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--url", action="append", help="form URL or file:// (repeatable)")
+    ap.add_argument("--urls-file", help=".txt (one URL per line) or .csv/.xlsx with a url column")
+    ap.add_argument("--data", default=str(DEFAULT_DATA), help=".csv/.xlsx/.json rows")
+    ap.add_argument("--rows", type=int, help="ignore --data, generate N rows with Faker")
+    ap.add_argument("--mode", choices=["all", "pair"], default="all",
+                    help="all = every URL x every row; pair = url[i] with row[i]")
+    ap.add_argument("--logins", help=".csv/.xlsx/.json accounts (username, password, login_url)")
+    ap.add_argument("--login-url", help="default login page for accounts without login_url")
+    ap.add_argument("--login-data", help="single account JSON (e.g. login.json)")
+    ap.add_argument("--no-submit", action="store_true", help="only fill, do not submit")
+    ap.add_argument("--submit", action="store_true", help=argparse.SUPPRESS)  # legacy
+    ap.add_argument("--fake-missing", action="store_true",
+                    help="generate Faker values for fields without data")
+    ap.add_argument("--faker-locale", default="en_US")
+    ap.add_argument("--retries", type=int, default=1,
+                    help="re-submit attempts after validation errors (default 1)")
+    ap.add_argument("--workers", type=int, default=1, help="parallel browser sessions")
+    ap.add_argument("--headless", action="store_true")
+    ap.add_argument("--slow", type=int, default=300, help="slow down actions (ms)")
+    ap.add_argument("--next-text", action="append", default=[],
+                    help="extra text of the 'next' button (repeatable)")
+    ap.add_argument("--next-selector", help="CSS selector of the 'next' button")
+    ap.add_argument("--submit-selector", help="CSS selector of the submit button")
+    ap.add_argument("--captcha-timeout", type=int, default=180)
+    ap.add_argument("--hold", type=float, default=None,
+                    help="seconds to keep the browser open at the end "
+                         "(default: wait for Enter, or 15s without a terminal)")
+    ap.add_argument("--pause", type=float, default=2.0,
+                    help="seconds to wait after each job in visible mode (default 2)")
+    ap.add_argument("--debug", action="store_true",
+                    help="print signals and top candidate keys for every field")
+    ap.add_argument("--inspect", action="store_true",
+                    help="only list the detected fields and best keys, fill nothing")
+    ap.add_argument("--map", help='JSON file {"css selector": "data key" | "=literal"} '
+                                  "that overrides automatic matching")
+    ap.add_argument("--no-highlight", action="store_true",
+                    help="do not outline fields while filling")
+    ap.add_argument("--cookies", choices=["accept", "reject", "ignore"], default="accept",
+                    help="what to do with cookie banners (default: accept)")
+    ap.add_argument("--out", default=str(DEFAULT_OUT), help="folder for report + screenshots")
+    args = ap.parse_args()
+
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "report.jsonl").unlink(missing_ok=True)
+
+    CFG = Settings(
+        headless=args.headless, slow=args.slow, submit=not args.no_submit,
+        fake_missing=args.fake_missing or args.rows is not None,
+        faker_locale=args.faker_locale, retries=max(0, args.retries),
+        next_selector=args.next_selector, submit_selector=args.submit_selector,
+        captcha_timeout=args.captcha_timeout, cookies=args.cookies, out=out, hold=args.hold, job_pause=args.pause,
+        highlight=not args.no_highlight, debug=args.debug, inspect=args.inspect,
+        field_map=json.loads(Path(args.map).read_text(encoding="utf-8")) if args.map else {},
+        interactive=sys.stdin.isatty() and args.workers <= 1 and not args.headless,
+    )
+    CFG.next_words.extend(args.next_text)
+
+    # --- inputs ------------------------------------------------------------
+    urls = list(args.url or [])
+    if args.urls_file:
+        urls += load_urls(args.urls_file)
+    urls = urls or [DEFAULT_URL]
+    records = [{} for _ in range(args.rows)] if args.rows else load_table(args.data)
+    if not records:
+        ap.error("no data rows found")
+    accounts = []
+    if args.logins:
+        accounts = load_logins(args.logins)
+    elif args.login_data:
+        creds = json.loads(Path(args.login_data).read_text(encoding="utf-8"))
+        accounts = [{"label": creds.get("username", "account"), "login_url": None,
+                     "creds": creds}]
+    if accounts and not args.login_url and not all(a["login_url"] for a in accounts):
+        ap.error("accounts without login_url need --login-url")
+
+    jobs = build_jobs(urls, records, args.mode)
+    log(f"{len(jobs)} job(s): {len(urls)} URL(s) x {len(records)} row(s), "
+        f"{max(1, len(accounts))} account(s), {max(1, args.workers)} worker(s)")
+
+    # --- tasks: one per account, or the jobs split across workers ----------
+    if accounts:
+        tasks = [{"account": a, "jobs": jobs, "default_login_url": args.login_url,
+                  "cfg": CFG} for a in accounts]
+    else:
+        n = max(1, args.workers)
+        chunks = [jobs[i::n] for i in range(n) if jobs[i::n]]
+        tasks = [{"account": None, "jobs": c, "default_login_url": None, "cfg": CFG}
+                 for c in chunks]
+
+    results: list[dict] = []
+    if args.workers > 1 and len(tasks) > 1:
+        with ProcessPoolExecutor(max_workers=args.workers) as pool:
+            for res in pool.map(run_session, tasks):
+                results.extend(res)
+    else:
+        for t in tasks:
+            results.extend(run_session(t))
+
+    results.sort(key=lambda r: (r.get("account") or "", r["job"]))
+    (out / "report.json").write_text(
+        json.dumps(results, indent=2, ensure_ascii=False), encoding="utf-8")
+    summary = {}
+    for r in results:
+        summary[r["status"]] = summary.get(r["status"], 0) + 1
+    log(f"\nDone: {summary}")
+    log(f"Report and screenshots: {out}")
+
+
+if __name__ == "__main__":
+    main()
+
+
+########## FILE: datagen.py ##########
+
+"""Constraint-aware fake data for form fields (Faker + a tiny regex generator)."""
+import random
+import re
+import string
+
+from faker import Faker
+
+try:  # private but stable since Python 3.11
+    import re._parser as _sre
+except Exception:  # pragma: no cover
+    _sre = None
+
+# (regex over normalized hint strings, generator name); order matters.
+SEMANTIC = [
+    (r"email|mail", "email"),
+    (r"phone|^tel$|^telno|^tel\d|mobile|^cell$|^cellphone", "phone"),
+    (r"firstname|givenname|forename|fname", "first_name"),
+    (r"lastname|surname|familyname|lname", "last_name"),
+    (r"fullname|^name$|yourname", "name"),
+    (r"username|userid|nickname|login|handle", "user_name"),
+    (r"password|passwd|pwd", "password"),
+    (r"zip|postal|postcode", "postcode"),
+    (r"city|town", "city"),
+    (r"country|nation", "country"),
+    (r"state|province|region", "state"),
+    (r"address|street", "street_address"),
+    (r"company|organi[sz]ation|employer", "company"),
+    (r"jobtitle|position|occupation|profession", "job"),
+    (r"url|website|homepage|link", "url"),
+    (r"birth|dob|bday", "birthdate"),
+    (r"^age$|^yourage$", "age"),
+    (r"message|comment|note|description|about|bio|feedback|text|yourself", "paragraph"),
+]
+
+
+def _norm(s) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(s).lower())
+
+
+def _int(v):
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        return None
+
+
+class DataGen:
+    def __init__(self, locale: str = "en_US", seed: int | None = None):
+        self.fake = Faker(locale)
+        if seed is not None:
+            Faker.seed(seed)
+        self.rng = random.Random(seed)
+
+    # ---- public -----------------------------------------------------------
+    def generate(self, f: dict):
+        """Return a value for field dict `f`, or None if it cannot be generated."""
+        kind = f["kind"]
+        if kind in ("select", "radio"):
+            opts = [o for o in f.get("options", []) if o.get("value") not in ("", None)]
+            if not opts:
+                return None
+            o = self.rng.choice(opts)
+            return o["label"] or o["value"]
+        if kind in ("combobox", "file"):
+            return None
+        if kind == "checkbox":
+            return True
+        value = self._by_kind(f, kind)
+        return self._constrain(f, value)
+
+    # ---- internals --------------------------------------------------------
+    def _semantic(self, f: dict) -> str | None:
+        pieces = [_norm(f.get(k, "")) for k in ("label", "name", "id", "placeholder")]
+        ac = f.get("autocomplete", "").split()
+        if ac:
+            pieces.append(_norm(ac[-1]))
+        for rx, gen in SEMANTIC:
+            if any(p and re.search(rx, p) for p in pieces):
+                return gen
+        return None
+
+    def _named(self, gen: str):
+        fk = self.fake
+        return {
+            "email": fk.email, "phone": fk.phone_number, "first_name": fk.first_name,
+            "last_name": fk.last_name, "name": fk.name, "user_name": fk.user_name,
+            "password": lambda: fk.password(length=12), "postcode": fk.postcode,
+            "city": fk.city, "country": fk.country, "state": fk.state,
+            "street_address": fk.street_address, "company": fk.company, "job": fk.job,
+            "url": fk.url, "birthdate": lambda: fk.date_of_birth(minimum_age=18).isoformat(),
+            "age": lambda: str(self.rng.randint(18, 70)),
+            "paragraph": lambda: fk.sentence(nb_words=10),
+        }[gen]()
+
+    def _by_kind(self, f: dict, kind: str):
+        fk = self.fake
+        if kind == "email":
+            return fk.email()
+        if kind == "tel":
+            return fk.phone_number()
+        if kind == "url":
+            return fk.url()
+        if kind == "password":
+            return fk.password(length=12)
+        if kind == "date":
+            return fk.date_of_birth(minimum_age=18).isoformat()
+        if kind == "time":
+            return fk.time(pattern="%H:%M")
+        if kind == "datetime-local":
+            return fk.date_time_this_year().strftime("%Y-%m-%dT%H:%M")
+        if kind == "month":
+            return fk.date_this_year().strftime("%Y-%m")
+        if kind == "week":
+            return fk.date_this_year().strftime("%Y-W%V")
+        if kind == "color":
+            return fk.hex_color()
+        if kind in ("number", "range"):
+            lo = _int(f.get("min")) if _int(f.get("min")) is not None else 1
+            hi = _int(f.get("max")) if _int(f.get("max")) is not None else lo + 100
+            return str(self.rng.randint(lo, max(lo, hi)))
+        gen = self._semantic(f)
+        if gen:
+            return self._named(gen)
+        return fk.word() if kind != "textarea" else fk.sentence(nb_words=12)
+
+    def _constrain(self, f: dict, value):
+        if value is None:
+            return None
+        value = str(value)
+        pattern = f.get("pattern")
+        if pattern:
+            ok = self._fullmatch(pattern, value)
+            tries = 0
+            while not ok and tries < 15:
+                tries += 1
+                value = self._by_kind(f, f["kind"])
+                ok = self._fullmatch(pattern, str(value))
+            if not ok:
+                value = self._from_pattern(pattern) or value
+        value = str(value)
+        mx, mn = _int(f.get("maxlength")), _int(f.get("minlength"))
+        if mx is not None and mx >= 0:
+            value = value[:mx]
+        if mn and len(value) < mn:
+            value = value + "x" * (mn - len(value))
+        return value
+
+    @staticmethod
+    def _fullmatch(pattern: str, value: str) -> bool:
+        try:  # HTML pattern attribute is an implicit ^(?:...)$
+            return re.fullmatch(pattern, value) is not None
+        except re.error:
+            return True
+
+    # ---- tiny regex-based generator for `pattern` attributes --------------
+    def _from_pattern(self, pattern: str) -> str | None:
+        if _sre is None:
+            return None
+        try:
+            parsed = _sre.parse(pattern)
+            return "".join(self._emit(parsed))
+        except Exception:
+            return None
+
+    def _chars_of_class(self, items) -> str:
+        negate = any(str(op) == "NEGATE" for op, _ in items)
+        chars = ""
+        for op, av in items:
+            name = str(op)
+            if name == "LITERAL":
+                chars += chr(av)
+            elif name == "RANGE":
+                chars += "".join(chr(c) for c in range(av[0], min(av[1], av[0] + 200) + 1))
+            elif name == "CATEGORY":
+                cat = str(av)
+                chars += (string.digits if "DIGIT" in cat and "NOT" not in cat
+                          else string.ascii_letters + string.digits + "_" if "WORD" in cat
+                          else " " if "SPACE" in cat else string.ascii_letters)
+        if negate:
+            pool = string.ascii_letters + string.digits
+            return "".join(c for c in pool if c not in chars) or "x"
+        return chars or "x"
+
+    def _emit(self, parsed):
+        out = []
+        for op, av in parsed:
+            name = str(op)
+            if name == "LITERAL":
+                out.append(chr(av))
+            elif name == "NOT_LITERAL":
+                out.append(self.rng.choice([c for c in string.ascii_letters if c != chr(av)]))
+            elif name == "ANY":
+                out.append(self.rng.choice(string.ascii_letters))
+            elif name == "IN":
+                out.append(self.rng.choice(self._chars_of_class(av)))
+            elif name == "CATEGORY":
+                cat = str(av)
+                out.append(self.rng.choice(string.digits if "DIGIT" in cat
+                                           else string.ascii_letters))
+            elif name in ("MAX_REPEAT", "MIN_REPEAT", "POSSESSIVE_REPEAT"):
+                lo, hi, sub = av
+                hi = min(hi, lo + 5) if hi > lo + 5 else hi
+                for _ in range(self.rng.randint(lo, hi)):
+                    out.extend(self._emit(sub))
+            elif name == "SUBPATTERN":
+                out.extend(self._emit(av[-1]))
+            elif name == "BRANCH":
+                out.extend(self._emit(self.rng.choice(av[1])))
+        return out
+
+
+########## FILE: inputs.py ##########
+
+"""Input loading: data tables (CSV / XLSX / JSON), URL lists and login accounts."""
+import csv
+import json
+import re
+from pathlib import Path
+
+
+def _clean_row(row: dict) -> dict:
+    """Strip keys/values and drop empty cells so they are not filled."""
+    out = {}
+    for k, v in row.items():
+        if k is None:
+            continue
+        key = str(k).strip()
+        if not key or v is None:
+            continue
+        if hasattr(v, "isoformat"):  # dates from Excel
+            v = v.date().isoformat() if hasattr(v, "date") else v.isoformat()
+        if isinstance(v, bool):
+            v = "true" if v else "false"
+        v = str(v).strip()
+        if v != "":
+            out[key] = v
+    return out
+
+
+def load_table(path) -> list[dict]:
+    """Load rows from .csv / .tsv / .xlsx / .json (object or list of objects)."""
+    path = Path(path)
+    suffix = path.suffix.lower()
+    if suffix == ".json":
+        data = json.loads(path.read_text(encoding="utf-8"))
+        rows = data if isinstance(data, list) else [data]
+        return rows
+    if suffix in (".xlsx", ".xlsm"):
+        from openpyxl import load_workbook
+        wb = load_workbook(path, read_only=True, data_only=True)
+        ws = wb.active
+        it = ws.iter_rows(values_only=True)
+        header = [str(h).strip() if h is not None else "" for h in next(it, [])]
+        return [r for r in (_clean_row(dict(zip(header, row))) for row in it) if r]
+    text = path.read_text(encoding="utf-8-sig")
+    try:
+        dialect = csv.Sniffer().sniff(text[:2048], delimiters=",;\t|")
+    except csv.Error:
+        dialect = csv.excel
+    reader = csv.DictReader(text.splitlines(), dialect=dialect)
+    return [r for r in (_clean_row(row) for row in reader) if r]
+
+
+def parse_urls(text: str) -> list[str]:
+    """One URL per line; blank lines and '#' comments are ignored."""
+    urls = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        urls.append(line)
+    return urls
+
+
+def load_urls(path) -> list[str]:
+    """URLs from a .txt (one per line) or a .csv/.xlsx with a 'url' column."""
+    path = Path(path)
+    if path.suffix.lower() in (".csv", ".xlsx", ".tsv"):
+        rows = load_table(path)
+        return [r["url"] for r in rows if r.get("url")]
+    return parse_urls(path.read_text(encoding="utf-8-sig"))
+
+
+def load_logins(path) -> list[dict]:
+    """Accounts to log in with.
+
+    Each row: any credential columns (username, password, ...) plus an optional
+    `login_url`. Returns [{"label", "login_url", "creds"}].
+    """
+    accounts = []
+    for row in load_table(path):
+        row = dict(row)
+        login_url = row.pop("login_url", None) or row.pop("url", None)
+        label = row.get("username") or row.get("email") or row.get("user") or "account"
+        accounts.append({"label": label, "login_url": login_url, "creds": row})
+    return accounts
+
+
+def to_file_uri_if_path(value: str) -> str:
+    """Allow plain local paths in URL lists."""
+    if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", value):
+        return value
+    p = Path(value).expanduser()
+    return p.resolve().as_uri() if p.exists() else value
+
+
+########## FILE: app.py ##########
+
+
+
+"""Streamlit UI for form_filler.py.
+
+Run:  streamlit run app.py      (or run run_ui.py from PyCharm)
+"""
+import json
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import pandas as pd
+import streamlit as st
+
+from inputs import load_table, load_logins, parse_urls
+
+
+def _under_streamlit() -> bool:
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+        return get_script_run_ctx(suppress_warning=True) is not None
+    except Exception:
+        return False
+
+
+if not _under_streamlit():
+    # Started as a plain script (e.g. PyCharm "Run app.py"): relaunch via `streamlit run`.
+    from streamlit.web import cli as stcli
+    sys.argv = ["streamlit", "run", str(Path(__file__).resolve())]
+    sys.exit(stcli.main())
+
+BASE = Path(__file__).resolve().parent
+RUNS = BASE / "runs"
+DEFAULT_URLS = (BASE / "test_form.html").as_uri()
+
+SAMPLE_DATA = (BASE / "samples" / "data.csv").read_text(encoding="utf-8") \
+    if (BASE / "samples" / "data.csv").exists() else "first_name,last_name,email\n"
+SAMPLE_LOGINS = "login_url,username,password\nhttps://example.com/login,user1,secret1\n"
+SAMPLE_URLS = "# one URL per line\nhttps://example.com/form\nhttps://example.com/contact\n"
+
+st.set_page_config(page_title="Form Filler", page_icon="📝", layout="wide")
+st.title("📝 Form Filler")
+st.caption("Fill web forms automatically from CSV/Excel data. "
+           "Use it only on sites you own or are allowed to test.")
+
+
+def save_upload(upload, folder: Path) -> Path:
+    path = folder / upload.name
+    path.write_bytes(upload.getvalue())
+    return path
+
+
+def preview_table(upload) -> list[dict]:
+    tmp = RUNS / "_preview"
+    tmp.mkdir(parents=True, exist_ok=True)
+    return load_table(save_upload(upload, tmp))
+
+
+# ---------------------------------------------------------------- inputs ----
+col_a, col_b = st.columns(2)
+
+with col_a:
+    st.subheader("1. Target links")
+    urls_text = st.text_area("Form URLs (one per line)", value=DEFAULT_URLS, height=140,
+                             help="Blank lines and lines starting with # are ignored.")
+    urls_file = st.file_uploader("...or upload a list (.txt / .csv with a url column)",
+                                 type=["txt", "csv"], key="urls")
+    st.download_button("Sample urls.txt", SAMPLE_URLS, "urls.txt")
+
+with col_b:
+    st.subheader("2. Form data")
+    data_file = st.file_uploader("CSV / Excel / JSON, one row = one submission",
+                                 type=["csv", "xlsx", "json"], key="data")
+    fake_rows = st.number_input("...or generate N rows of fake data (no file)",
+                                min_value=0, max_value=1000, value=0, step=1)
+    if data_file is not None:
+        try:
+            rows = preview_table(data_file)
+            st.write(f"{len(rows)} row(s)")
+            st.dataframe(pd.DataFrame(rows).head(10), width='stretch')
+        except Exception as e:  # noqa: BLE001
+            st.error(f"Cannot read data file: {e}")
+    st.download_button("Sample data.csv", SAMPLE_DATA, "data.csv")
+
+st.subheader("3. Login (optional)")
+col_c, col_d = st.columns(2)
+with col_c:
+    logins_file = st.file_uploader(
+        "Accounts CSV/Excel (columns: username, password, optional login_url)",
+        type=["csv", "xlsx", "json"], key="logins")
+    st.download_button("Sample logins.csv", SAMPLE_LOGINS, "logins.csv")
+with col_d:
+    login_url = st.text_input("Default login URL (for accounts without login_url)")
+    if logins_file is not None:
+        try:
+            tmp = RUNS / "_preview"
+            tmp.mkdir(parents=True, exist_ok=True)
+            accounts = load_logins(save_upload(logins_file, tmp))
+            masked = [{"account": a["label"], "login_url": a["login_url"] or "(default)",
+                       "fields": ", ".join(a["creds"])} for a in accounts]
+            st.write(f"{len(accounts)} account(s) — passwords are not shown")
+            st.dataframe(pd.DataFrame(masked), width='stretch')
+        except Exception as e:  # noqa: BLE001
+            st.error(f"Cannot read accounts file: {e}")
+    st.caption("Each account runs in its own isolated browser session. "
+               "Use test accounts only.")
+
+# --------------------------------------------------------------- options ----
+st.subheader("4. Options")
+o1, o2, o3, o4 = st.columns(4)
+with o1:
+    mode = st.selectbox("Combine links and rows", ["all", "pair"],
+                        help="all: every link x every row.  pair: link 1 with row 1, ...")
+    submit = st.checkbox("Click submit", value=True)
+with o2:
+    fake_missing = st.checkbox("Generate fake data for empty fields", value=False)
+    retries = st.number_input("Retries after validation errors", 0, 5, 1)
+with o3:
+    headless = st.checkbox("Headless (no browser window)", value=False,
+                           help="CAPTCHAs need a visible window so you can solve them.")
+    slow = st.number_input("Slow down actions (ms)", 0, 3000, 600, step=100,
+                           help="Delay between every browser action so you can follow it.")
+    pause = st.number_input("Pause after each job (s)", 0, 60, 3,
+                            help="Time to look at the result before the next job.")
+    hold = st.number_input("Keep browser open at the end (s)", 0, 600, 30)
+with o4:
+    workers = st.number_input("Parallel workers", 1, 8, 1,
+                              help="Runs several browsers at once. CAPTCHAs cannot be "
+                                   "solved in parallel mode.")
+    next_text = st.text_input("Extra 'next' button texts (comma separated)")
+    cookies = st.selectbox("Cookie banners", ["accept", "reject", "ignore"],
+                           help="accept: click Accept all.  reject: click Reject / "
+                                "Necessary only.  ignore: do nothing.")
+submit_selector = st.text_input("Submit button CSS selector (optional)")
+next_selector = st.text_input("Next button CSS selector (optional)")
+with st.expander("Field detection tools"):
+    debug = st.checkbox("Debug: log the signals and top candidate keys of every field")
+    field_map_text = st.text_area(
+        "Manual field map (JSON) - overrides automatic matching",
+        placeholder='{"input[name=\'entry.123\']": "=blue", "#phone": "phone"}',
+        help='Keys are CSS selectors. Values are a data column name, or "=text" for a '
+             'fixed literal value.')
+
+# ------------------------------------------------------------------ run -----
+b1, b2 = st.columns(2)
+run_clicked = b1.button("▶ Run", type="primary")
+inspect_clicked = b2.button("🔍 Inspect fields only (nothing is filled)")
+if run_clicked or inspect_clicked:
+    urls = parse_urls(urls_text)
+    run_dir = RUNS / time.strftime("%Y%m%d-%H%M%S")
+    run_dir.mkdir(parents=True, exist_ok=True)
+    if urls_file is not None:
+        p = save_upload(urls_file, run_dir)
+        from inputs import load_urls
+        urls += load_urls(p)
+    if not urls:
+        st.error("Add at least one URL.")
+        st.stop()
+
+    (run_dir / "urls.txt").write_text("\n".join(urls), encoding="utf-8")
+    cmd = [sys.executable, "-u", str(BASE / "form_filler.py"),
+           "--urls-file", str(run_dir / "urls.txt"), "--out", str(run_dir),
+           "--mode", mode, "--retries", str(retries), "--workers", str(workers),
+           "--slow", str(slow), "--cookies", cookies,
+           "--pause", str(pause), "--hold", str(hold)]
+    if data_file is not None:
+        cmd += ["--data", str(save_upload(data_file, run_dir))]
+    elif fake_rows > 0:
+        cmd += ["--rows", str(int(fake_rows))]
+    else:
+        st.error("Upload a data file or choose how many fake rows to generate.")
+        st.stop()
+    if logins_file is not None:
+        cmd += ["--logins", str(save_upload(logins_file, run_dir))]
+        if login_url:
+            cmd += ["--login-url", login_url]
+    if not submit:
+        cmd.append("--no-submit")
+    if fake_missing:
+        cmd.append("--fake-missing")
+    if headless:
+        cmd.append("--headless")
+    for t in [x.strip() for x in next_text.split(",") if x.strip()]:
+        cmd += ["--next-text", t]
+    if submit_selector:
+        cmd += ["--submit-selector", submit_selector]
+    if next_selector:
+        cmd += ["--next-selector", next_selector]
+    if debug:
+        cmd.append("--debug")
+    if inspect_clicked:
+        cmd.append("--inspect")
+        if not headless:
+            cmd.append("--headless")
+    if field_map_text.strip():
+        try:
+            json.loads(field_map_text)
+        except json.JSONDecodeError as e:
+            st.error(f"Field map is not valid JSON: {e}")
+            st.stop()
+        (run_dir / "map.json").write_text(field_map_text, encoding="utf-8")
+        cmd += ["--map", str(run_dir / "map.json")]
+
+    st.info(f"Run folder: `{run_dir}`")
+    log_box = st.empty()
+    lines: list[str] = []
+    proc = subprocess.Popen(cmd, cwd=BASE, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True)
+    for line in proc.stdout:
+        lines.append(line)
+        log_box.code("".join(lines[-40:]), language="text")
+    code = proc.wait()
+    (run_dir / "log.txt").write_text("".join(lines), encoding="utf-8")
+    st.session_state["last_run"] = str(run_dir)
+    (st.success if code == 0 else st.error)(f"Finished with exit code {code}")
+
+# --------------------------------------------------------------- results ----
+last = st.session_state.get("last_run")
+if last:
+    run_dir = Path(last)
+    report = run_dir / "report.json"
+    if report.exists():
+        results = json.loads(report.read_text(encoding="utf-8"))
+        st.subheader("Results")
+        df = pd.DataFrame([{
+            "job": r["job"], "account": r.get("account"), "url": r["url"],
+            "row": r["row"], "status": r["status"],
+            "filled": len(r.get("filled", [])), "attempts": r.get("attempts"),
+            "invalid": ", ".join(f["field"] for f in r.get("invalid_fields", [])),
+            "error": r.get("error"),
+        } for r in results])
+        st.dataframe(df, width='stretch')
+        st.download_button("Download report.json", report.read_bytes(), "report.json")
+        for r in results:
+            with st.expander(f"Job {r['job']} — {r['status']} — {r['url']}"):
+                if r.get("fields"):
+                    st.caption("Detected fields and the best matching data key")
+                    st.dataframe(pd.DataFrame([{
+                        "kind": f["kind"], "name": f["name"], "id": f["id"],
+                        "label": f["label"], "label from": f["label_source"],
+                        "class": f["class"][:40],
+                        "best key": f["top"][0]["key"] if f["top"] else "",
+                        "score": f["top"][0]["score"] if f["top"] else 0,
+                        "via": f["top"][0]["source"] if f["top"] else "",
+                        "date part": f.get("part") or "",
+                    } for f in r["fields"]]), width='stretch')
+                if r.get("filled"):
+                    st.dataframe(pd.DataFrame(r["filled"]), width='stretch')
+                if r.get("page_errors"):
+                    st.warning("Page errors: " + "; ".join(r["page_errors"]))
+                shot = run_dir / r.get("screenshot", "")
+                if r.get("screenshot") and shot.exists():
+                    st.image(str(shot))
+
+
+########## FILE: run_ui.py ##########
+
+"""Start the Streamlit UI. In PyCharm just run this file."""
+import sys
+from pathlib import Path
+
+from streamlit.web import cli as stcli
+
+if __name__ == "__main__":
+    app = Path(__file__).with_name("app.py")
+    sys.argv = ["streamlit", "run", str(app), "--server.headless", "false"]
+    sys.exit(stcli.main())
+
+
+########## FILE: data.json ##########
+
+[
+  {
+    "first_name": "Anna",
+    "last_name": "Miller",
+    "email": "anna.miller@example.com",
+    "phone": "+385911234567",
+    "birth_date": "1999-05-17",
+    "city": "Zagreb",
+    "country": "Croatia",
+    "address": "Main Street 12",
+    "gender": "Female",
+    "newsletter": true,
+    "message": "Hello, this is a test message."
+  },
+  {
+    "first_name": "Mark",
+    "last_name": "Cooper",
+    "email": "mark.cooper@example.com",
+    "phone": "+385981112223",
+    "birth_date": "2001-11-02",
+    "city": "Split",
+    "country": "Germany",
+    "address": "Second Avenue 7",
+    "gender": "Male",
+    "newsletter": false,
+    "message": "Second test message."
+  }
+]
+
+
+########## FILE: samples/data.csv ##########
+
+first_name,last_name,email,phone,birth_date,city,country,address,gender,newsletter,message
+Anna,Miller,anna.miller@example.com,+385911234567,1999-05-17,Zagreb,Croatia,Main Street 12,Female,true,Hello from Anna
+Mark,Cooper,mark.cooper@example.com,+385981112223,2001-11-02,Split,Germany,Second Avenue 7,Male,false,Hello from Mark

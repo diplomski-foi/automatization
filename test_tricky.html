@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Tricky markup test</title>
+  <style>
+    body { font-family: sans-serif; max-width: 520px; margin: 2rem auto; }
+    .row { margin-bottom: 1rem; }
+    input[type=text], input[type=email] { display: block; width: 100%; padding: .4rem; }
+    /* styled toggle: the real checkbox is invisible, only the label is shown */
+    .switch input { opacity: 0; width: 0; height: 0; position: absolute; }
+    .switch .slider { display: inline-block; width: 36px; height: 18px; background: #ccc;
+                      border-radius: 9px; vertical-align: middle; }
+    .editor { border: 1px solid #888; min-height: 3rem; padding: .4rem; }
+  </style>
+</head>
+<body>
+  <h1>Different naming conventions</h1>
+  <form id="form">
+    <!-- ASP.NET WebForms -->
+    <div class="row">
+      <span>x</span>
+      <input type="text" name="ctl00$MainContent$txtFullName" id="ctl00_MainContent_txtFullName">
+    </div>
+    <!-- WooCommerce -->
+    <div class="row"><input type="text" name="billing_first_name" id="billing_first_name"></div>
+    <!-- Rails -->
+    <div class="row"><input type="text" name="user[last_name]" class="form-control"></div>
+    <!-- Django: type=text on purpose, label text is meaningless -->
+    <div class="row"><input type="text" name="email" id="id_email" aria-label="Q7"></div>
+    <!-- visually hidden checkbox with a visible styled label -->
+    <label class="switch row"><input type="checkbox" name="newsletter"><span class="slider"></span> Keep me posted</label>
+    <!-- contenteditable editor -->
+    <div class="row"><div class="editor" contenteditable="true" data-field="message" id="editor"></div></div>
+    <!-- opaque name: needs a manual map -->
+    <div class="row"><input type="text" name="entry.1234567" aria-label="Favourite colour"></div>
+    <button type="submit">Send</button>
+  </form>
+  <div id="result" class="success" style="display:none"></div>
+  <script>
+    document.getElementById('form').addEventListener('submit', e => {
+      e.preventDefault();
+      const d = Object.fromEntries(new FormData(e.target));
+      d.message = document.getElementById('editor').textContent;
+      const r = document.getElementById('result');
+      r.style.display = 'block';
+      r.textContent = 'Submitted: ' + JSON.stringify(d);
+    });
+  </script>
+</body>
+</html>

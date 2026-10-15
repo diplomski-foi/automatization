@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="hr">
+<head>
+  <meta charset="utf-8">
+  <title>Datum rođenja u tri polja</title>
+  <style>
+    body { font-family: sans-serif; max-width: 520px; margin: 2rem auto; }
+    fieldset { margin-bottom: 1.5rem; }
+    .row { display: flex; gap: .5rem; }
+    input { padding: .4rem; width: 5rem; }
+  </style>
+</head>
+<body>
+  <h1>Datum rođenja / Date of birth</h1>
+
+  <!-- A: Croatian, opaque names, text inputs identified only by aria-label / placeholder -->
+  <fieldset>
+    <legend>Datum rođenja</legend>
+    <div class="row">
+      <input type="text" name="a1" id="q1" maxlength="2" placeholder="DD" aria-label="Dan">
+      <input type="text" name="a2" id="q2" maxlength="2" placeholder="MM" aria-label="Mjesec">
+      <input type="text" name="a3" id="q3" maxlength="4" placeholder="GGGG" aria-label="Godina">
+    </div>
+  </fieldset>
+
+  <!-- B: English, number inputs with ranges and English names -->
+  <fieldset>
+    <legend>Date of birth</legend>
+    <div class="row">
+      <input type="number" name="dob_day" min="1" max="31" placeholder="Day">
+      <input type="number" name="dob_month" min="1" max="12" placeholder="Month">
+      <input type="number" name="dob_year" min="1900" max="2026" placeholder="Year">
+    </div>
+  </fieldset>
+
+  <!-- C: only visible labels in Croatian, no helpful attributes except numeric ranges -->
+  <fieldset>
+    <legend>Birth</legend>
+    <div class="row">
+      <label>Dan <input type="number" name="x1" min="1" max="31"></label>
+      <label>Mjesec <input type="number" name="x2" min="1" max="12"></label>
+      <label>Godina <input type="number" name="x3" min="1900" max="2026"></label>
+    </div>
+  </fieldset>
+
+  <button id="send">Pošalji</button>
+  <div id="result" class="success" style="display:none"></div>
+  <script>
+    document.getElementById('send').addEventListener('click', () => {
+      const v = [...document.querySelectorAll('input')].map(i => i.value);
+      const r = document.getElementById('result');
+      r.style.display = 'block';
+      r.textContent = 'Submitted: ' + v.join(' | ');
+    });
+  </script>
+</body>
+</html>

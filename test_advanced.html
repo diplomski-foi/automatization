@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Advanced test form</title>
+  <style>body{font-family:sans-serif;max-width:520px;margin:2rem auto}label{display:block;margin-bottom:.8rem}input,textarea{display:block;width:100%;padding:.4rem}</style>
+</head>
+<body>
+  <h1>Advanced features</h1>
+  <form id="form">
+    <label>Company <input type="text" name="company"></label>
+
+    <!-- field inside an open shadow root -->
+    <x-card></x-card>
+
+    <!-- text date picker replacement: expects dd/mm/yyyy -->
+    <label>Start date <input type="text" name="start" placeholder="dd/mm/yyyy"></label>
+
+    <!-- file upload -->
+    <label>Resume <input type="file" name="cv"></label>
+
+    <!-- constrained field: wrong data fails validation, retry generates a valid one -->
+    <label>Voucher code <input type="text" name="voucher" required maxlength="8" pattern="[A-Z]{3}-[0-9]{4}"></label>
+
+    <!-- required, no data supplied: filled by Faker when --fake-missing / retry -->
+    <label>Contact email <input type="email" name="contact" required></label>
+
+    <label>Tell us about yourself <textarea name="bio"></textarea></label>
+    <button type="submit">Submit</button>
+  </form>
+  <div id="result" class="success" style="display:none"></div>
+  <script>
+    customElements.define('x-card', class extends HTMLElement {
+      constructor() {
+        super();
+        this.attachShadow({mode: 'open'}).innerHTML =
+          '<label>Nickname <input type="text" id="nick"></label>';
+      }
+    });
+    document.getElementById('form').addEventListener('submit', e => {
+      e.preventDefault();
+      const d = Object.fromEntries(new FormData(e.target));
+      d.cv = d.cv && d.cv.name;
+      d.nickname = document.querySelector('x-card').shadowRoot.getElementById('nick').value;
+      const r = document.getElementById('result');
+      r.style.display = 'block';
+      r.textContent = 'Submitted: ' + JSON.stringify(d);
+    });
+  </script>
+</body>
+</html>

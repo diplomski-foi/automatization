@@ -1,0 +1,9 @@
+[
+  {
+    "company": "Acme Ltd",
+    "nickname": "annie",
+    "start_date": "2024-03-15",
+    "resume": "samples/sample_resume.txt",
+    "voucher": "wrong"
+  }
+]

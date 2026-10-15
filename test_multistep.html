@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Multi-step form</title>
+  <style>body{font-family:sans-serif;max-width:480px;margin:2rem auto}label{display:block;margin-bottom:.8rem}input,select,textarea{display:block;width:100%;padding:.4rem}</style>
+</head>
+<body>
+  <h1>Registration</h1>
+  <form id="form">
+    <div class="step">
+      <h2>Step 1: Personal details</h2>
+      <label>First name <input type="text" name="first_name"></label>
+      <label>Last name <input type="text" name="last_name"></label>
+      <label>Email <input type="email" name="email"></label>
+      <button type="button" class="next">Next</button>
+    </div>
+    <div class="step" hidden>
+      <h2>Step 2: Location</h2>
+      <label>City
+        <select name="city"><option value="">--</option><option>Zagreb</option><option>Split</option></select>
+      </label>
+      <label>Address <input type="text" name="address"></label>
+      <button type="button" class="prev">Back</button>
+      <button type="button" class="next">Continue</button>
+    </div>
+    <div class="step" hidden>
+      <h2>Step 3: Finish</h2>
+      <label>Message <textarea name="message"></textarea></label>
+      <label><input type="checkbox" name="newsletter"> Newsletter</label>
+      <button type="button" class="prev">Back</button>
+      <button type="submit">Submit</button>
+    </div>
+  </form>
+  <div id="result" class="success" style="display:none"></div>
+  <script>
+    const steps = [...document.querySelectorAll('.step')];
+    let cur = 0;
+    const show = i => { cur = i; steps.forEach((s, n) => s.hidden = n !== i); };
+    document.querySelectorAll('.next').forEach(b => b.onclick = () => show(cur + 1));
+    document.querySelectorAll('.prev').forEach(b => b.onclick = () => show(cur - 1));
+    document.getElementById('form').addEventListener('submit', e => {
+      e.preventDefault();
+      const r = document.getElementById('result');
+      r.style.display = 'block';
+      r.textContent = 'Submitted: ' + JSON.stringify(Object.fromEntries(new FormData(e.target)));
+    });
+  </script>
+</body>
+</html>

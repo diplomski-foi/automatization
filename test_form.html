@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Test form</title>
+  <style>
+    body { font-family: sans-serif; max-width: 480px; margin: 2rem auto; }
+    label, fieldset { display: block; margin-bottom: .8rem; }
+    input[type=text], input[type=email], input[type=tel], input[type=date], select, textarea { display: block; width: 100%; padding: .4rem; }
+    #result { margin-top: 1rem; padding: .6rem; background: #e6f4ea; display: none; }
+  </style>
+</head>
+<body>
+  <h1>Sign up</h1>
+  <form id="form">
+    <label>First name
+      <input type="text" name="first_name" placeholder="Enter first name">
+    </label>
+    <label>Last name
+      <input type="text" name="last_name">
+    </label>
+    <label for="mail">Email address</label>
+    <input id="mail" type="email" name="user_email">
+    <label>Phone
+      <input type="tel" name="phone">
+    </label>
+    <label>Date of birth
+      <input type="date" name="dob">
+    </label>
+    <label>City
+      <select name="city">
+        <option value="">-- choose --</option>
+        <option value="zg">Zagreb</option>
+        <option value="st">Split</option>
+        <option value="ri">Rijeka</option>
+      </select>
+    </label>
+    <fieldset>
+      <legend>Gender</legend>
+      <label><input type="radio" name="gender" value="m"> Male</label>
+      <label><input type="radio" name="gender" value="f"> Female</label>
+    </fieldset>
+    <label><input type="checkbox" name="newsletter"> Newsletter</label>
+    <label>Message
+      <textarea name="message" rows="3"></textarea>
+    </label>
+    <button type="submit">Send</button>
+  </form>
+  <div id="result" class="success"></div>
+  <script>
+    document.getElementById('form').addEventListener('submit', e => {
+      e.preventDefault();
+      const d = Object.fromEntries(new FormData(e.target));
+      const r = document.getElementById('result');
+      r.style.display = 'block';
+      r.textContent = 'Submitted: ' + JSON.stringify(d);
+    });
+  </script>
+</body>
+</html>

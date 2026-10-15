@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Login</title></head>
+<body style="font-family:sans-serif;max-width:360px;margin:2rem auto">
+  <h1>Log in</h1>
+  <form id="login">
+    <label>Username <input type="text" name="username"></label><br><br>
+    <label>Password <input type="password" name="password"></label><br><br>
+    <button>Log in</button>
+  </form>
+  <p id="err" style="color:#b00020"></p>
+  <script>
+    document.getElementById('login').addEventListener('submit', e => {
+      e.preventDefault();
+      const d = Object.fromEntries(new FormData(e.target));
+      if (d.username === 'student' && d.password === 'test123')
+        location.href = 'test_form.html';   // "logged in" -> form
+      else document.getElementById('err').textContent = 'Invalid credentials';
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Label inference test</title>
+  <style>
+    body { font-family: sans-serif; max-width: 520px; margin: 2rem auto; }
+    .row { margin-bottom: 1rem; }
+    input { padding: .4rem; }
+    .css-label::before { content: "City"; display: block; font-weight: bold; }
+    table td { padding: .3rem .6rem; }
+  </style>
+</head>
+<body>
+  <h1>Labels in many different ways (no name= attributes)</h1>
+  <form id="form">
+    <!-- 1. label[for] -->
+    <div class="row">
+      <label for="a1">First name</label>
+      <input id="a1" type="text">
+    </div>
+    <!-- 2. aria-labelledby -->
+    <div class="row">
+      <span id="l2">Last name</span>
+      <input aria-labelledby="l2" type="text">
+    </div>
+    <!-- 3. table cell to the left -->
+    <table class="row"><tr>
+      <td>Email address</td>
+      <td><input type="text"></td>
+    </tr></table>
+    <!-- 4. plain text before the input -->
+    <div class="row">Phone number<br><input type="text"></div>
+    <!-- 5. label text injected by CSS ::before -->
+    <div class="row css-label"><input type="text"></div>
+    <!-- 6. title attribute -->
+    <div class="row"><input type="text" title="Country"></div>
+    <!-- 7. only an autocomplete hint, no visible label -->
+    <div class="row"><input type="text" autocomplete="bday"></div>
+    <!-- 8. only a placeholder -->
+    <div class="row"><input type="text" placeholder="Your message"></div>
+    <!-- Not a type=submit button: found through its text -->
+    <input type="button" id="send" value="Send application">
+  </form>
+  <div id="result" class="success" style="display:none"></div>
+  <script>
+    document.getElementById('send').addEventListener('click', () => {
+      const vals = [...document.querySelectorAll('input[type=text]')].map(i => i.value);
+      const r = document.getElementById('result');
+      r.style.display = 'block';
+      r.textContent = 'Submitted: ' + JSON.stringify(vals);
+    });
+  </script>
+</body>
+</html>

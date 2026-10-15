@@ -1,0 +1,10 @@
+[
+  {
+    "first_name": "Ana",
+    "last_name": "Horvat",
+    "birth_date": "1999-05-17",
+    "gender": "Female",
+    "email": "ana.horvat@example.com",
+    "password": "Test-1234!"
+  }
+]

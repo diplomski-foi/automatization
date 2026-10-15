@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <title>Opaque names test</title>
+  <style>
+    body { font-family: sans-serif; max-width: 480px; margin: 2rem auto; }
+    label { display: block; margin-bottom: .8rem; }
+    input { display: block; width: 100%; padding: .4rem; }
+  </style>
+</head>
+<body>
+  <h1>Anmeldung</h1>
+  <!-- every name / id / class is random; labels are German / Croatian -->
+  <form id="form">
+    <label for="qzjd83">Vorname</label>
+    <input id="qzjd83" name="x9f3k" class="sdklfndkfjhsidofis" type="text">
+
+    <label for="kk29ds">Nachname</label>
+    <input id="kk29ds" name="zz81q" class="oiuwerhkjsdfn" type="text">
+
+    <label for="p0o9i8">Ihre Stadt</label>
+    <input id="p0o9i8" name="mmn12" class="qpwoeiruty" type="text">
+
+    <label for="a1s2d3">Land</label>
+    <input id="a1s2d3" name="vbn45" class="zxcvbnmasd" type="text">
+
+    <label for="w3e4r5">Lozinka</label>
+    <input id="w3e4r5" name="rty67" class="lkjhgfdsa" type="text">
+
+    <!-- no label at all: only the placeholder example reveals the meaning -->
+    <input id="u7i8o9" name="hjk01" class="poiuytrewq" type="text" placeholder="name@example.com">
+    <br><br>
+    <input id="t5y6u7" name="bnm23" class="asdfghjklq" type="text" placeholder="+385 91 234 5678">
+    <br><br>
+    <button type="submit">Senden</button>
+  </form>
+  <div id="result" class="success" style="display:none"></div>
+  <script>
+    document.getElementById('form').addEventListener('submit', e => {
+      e.preventDefault();
+      document.getElementById('result').style.display = 'block';
+      document.getElementById('result').textContent = 'Submitted';
+    });
+  </script>
+</body>
+</html>

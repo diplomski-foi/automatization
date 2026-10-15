@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Cookie banner test</title>
+  <style>
+    body { font-family: sans-serif; max-width: 480px; margin: 2rem auto; }
+    label { display: block; margin-bottom: .8rem; }
+    input { display: block; width: 100%; padding: .4rem; }
+    /* full-screen overlay: blocks clicks on the form until a choice is made */
+    #cookie-banner { position: fixed; inset: 0; background: rgba(0,0,0,.6); z-index: 10;
+                     display: none; align-items: flex-end; justify-content: center; }
+    #cookie-banner .box { background: #fff; padding: 1.2rem; width: 100%; }
+    #cookie-banner button { margin-right: .6rem; padding: .5rem 1rem; }
+  </style>
+</head>
+<body>
+  <h1>Newsletter</h1>
+  <form id="form">
+    <label>First name <input type="text" name="first_name"></label>
+    <label>Email <input type="email" name="email"></label>
+    <button type="submit">Subscribe</button>
+  </form>
+  <div id="result" class="success" style="display:none"></div>
+
+  <div id="cookie-banner" role="dialog" aria-label="Cookie consent">
+    <div class="box">
+      <p>We use cookies to improve your experience.</p>
+      <button id="manage">Cookie settings</button>
+      <button id="reject">Reject all</button>
+      <button id="accept">Accept all cookies</button>
+    </div>
+  </div>
+  <script>
+    // banner appears a little late, like on real sites
+    setTimeout(() => document.getElementById('cookie-banner').style.display = 'flex', 700);
+    const choose = what => () => {
+      document.getElementById('cookie-banner').remove();
+      document.body.dataset.cookies = what;
+    };
+    document.getElementById('accept').onclick = choose('accepted');
+    document.getElementById('reject').onclick = choose('rejected');
+    document.getElementById('form').addEventListener('submit', e => {
+      e.preventDefault();
+      const r = document.getElementById('result');
+      r.style.display = 'block';
+      r.textContent = 'Subscribed (cookies: ' + (document.body.dataset.cookies || 'none') + ')';
+    });
+  </script>
+</body>
+</html>
